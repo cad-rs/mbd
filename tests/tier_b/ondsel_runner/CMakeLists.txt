@@ -1,0 +1,8 @@
+cmake_minimum_required(VERSION 3.16)
+project(ondsel_runner CXX)
+set(CMAKE_CXX_STANDARD 17)
+add_subdirectory(${ONDSEL_SRC} ondsel)
+add_executable(ondsel_run main.cpp)
+target_include_directories(ondsel_run PRIVATE ${ONDSEL_SRC}/OndselSolver)
+target_compile_definitions(ondsel_run PRIVATE _USE_MATH_DEFINES)
+target_link_libraries(ondsel_run PRIVATE OndselSolver)

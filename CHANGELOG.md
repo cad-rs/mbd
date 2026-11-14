@@ -12,6 +12,19 @@
 
 ## Unreleased (M1)
 
+### Tier B pipeline
+
+- `asmt` module: `write_asmt` exports a system to OndselSolver's `.asmt`
+  (the FreeCAD Assembly solver format): parts, grounding fixed joints, the
+  seven lower pairs, constant-rate and harmonic motions. New code
+  `asmt_unsupported`.
+- `tests/tier_b/`: three cases Tier A does not cover (offset crank-slider,
+  spatial RSUR with spherical + universal joints, a nested chain with two
+  drivers on a cylindrical joint and a prismatic joint in a rotating frame),
+  the reference runner source, and `examples/tier_b.rs` (export / convert
+  OndselSolver's time series to JSON). The comparison test is ignored until
+  the reference JSON is generated.
+
 ### Second slice: velocity / acceleration levels, redundancy, sweep
 
 - Velocity and acceleration levels: `solve_frame` (one instant, all three

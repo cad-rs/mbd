@@ -24,6 +24,7 @@
 //! dynamics + implicit integration + reaction recovery; M3 force library;
 //! M4 assembly wiring. Nothing here pre-seeds M5 (contact/friction).
 
+pub mod asmt;
 pub mod body;
 pub mod driver;
 pub mod error;
@@ -34,6 +35,7 @@ pub mod kinematics;
 mod linalg;
 pub mod system;
 
+pub use asmt::{write_asmt, AsmtSimulation};
 pub use body::{Body, BodyId, Marker, MarkerId};
 pub use driver::{Driver, DriverProfile, DriverSample, DriverSlot};
 pub use error::{codes, MbdError};

@@ -117,8 +117,11 @@ equations only at the position level; the tangent-space levels have none.
   continuity, rocker rate/acceleration) **green** (`tests/kinematics_benchmarks.rs`);
   OndselSolver `.asmt` reference-pose comparison (Tier B, reusing the gap
   doc Phase 5 methodology — the `.asmt` text format is dependency-free;
-  hand-written samples feed an independent OndselSolver exe producing
-  reference JSON) **open**.
+  the samples are exported from the test systems by `write_asmt`, an
+  independent OndselSolver exe produces the reference JSON): **pipeline
+  ready** (`src/asmt.rs`, `examples/tier_b.rs`, `tests/tier_b/` — offset
+  crank-slider, spatial RSUR, nested cylindrical/fixed/prismatic chain);
+  **references pending** an OndselSolver build.
 
 ### M1.5 CAD-grade kinematics (proposed, pending review)
 What the commercial CAD motion tools have at the kinematic level that the

@@ -55,4 +55,6 @@ pub mod codes {
     pub const KINEMATIC_SINGULAR: &str = "kinematic_singular";
     /// A time grid is not finite and non-decreasing.
     pub const BAD_TIME_GRID: &str = "bad_time_grid";
+    /// The system uses something the `.asmt` export does not cover.
+    pub const ASMT_UNSUPPORTED: &str = "asmt_unsupported";
 }
