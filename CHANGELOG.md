@@ -10,7 +10,21 @@
   validation gates; serde golden round-trip tests.
 - Dependency on `rcad-gcs` declared for the M1 position-level solver.
 
-## Unreleased (M1 + M1.5 + M2 + M3 complete, performance channel, M4 in progress)
+## Unreleased (M1 + M1.5 + M2 + M3 + M4 complete, performance channel)
+
+### M4 card 2 — integrator's guide and sample adapter (M4 complete)
+
+- `docs/INTEGRATING.md`: the contract an adapter writes against — scope,
+  units and frames, marker placement (`local = R_bodyᵀ·(world − t_body)`),
+  a CAD-mate → `JointKind` table, drivers / couplers / forces, studies,
+  result tables and the reaction convention, redundancy, the error-code
+  catalogue, determinism and serialization, an adapter checklist, API
+  stability.
+- `examples/adapter.rs`: a neutral CAD-style model (mm, kg·mm², world-frame
+  mates, rpm motors) → `System` with an id lookup, run as a kinematic study
+  with reactions, printed as CSV; `tests/adapter.rs` runs it and checks the
+  stroke against `r·cos θ + √(l² − r²·sin²θ)`, the three redundant
+  equations and the reaction rows.
 
 ### M4 card 1 — study API and result tables
 
@@ -316,5 +330,5 @@ the linear solver).
 
 ### Next
 
-- M4 assembly-domain wiring (assembly → mbd system conversion, study
-  results to the tool surface).
+- Tier C: cross-check against MuJoCo (Python via uv): the same models
+  exported, trajectories and energy compared at tolerance level.

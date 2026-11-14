@@ -15,7 +15,7 @@ the consumer's code.
 | M2 | Forward dynamics, index-3 HHT-α with error control, static equilibrium, joint reactions | **done** (Tier A closed forms, momentum audit; Tier B reactions vs OndselSolver ≤ 1.4e-10 N) |
 | M3 | Force library: function forces (time / state curves), follower loads, line forces, preloaded springs, joint spring-dampers, bushings, work audit | **done** |
 | perf | Sparse per-step work: owner-local Jacobian, coloured differences, sparse LDLᵀ | **done** (100-body chain ≈ 2.3 s per simulated second) |
-| M4 | Kernel-neutral integration surface: study API, result tables, integrator's guide + sample adapter | proposed |
+| M4 | Kernel-neutral integration surface: study API, result tables (serde + CSV), integrator's guide ([`docs/INTEGRATING.md`](docs/INTEGRATING.md)) + sample adapter | **done** |
 
 ## How it models
 
@@ -61,6 +61,8 @@ Over-constrained layouts (a planar loop built from 3D joints) are normal:
 `diagnose` reports the degrees of freedom, the mobility and the redundant
 equations, and the linear levels skip the redundant ones.
 
+Writing an adapter for your CAD kernel or application: see
+[`docs/INTEGRATING.md`](docs/INTEGRATING.md) and `examples/adapter.rs`.
 See `ROADMAP.md` for the milestone plan and the benchmark gates.
 
 ## License

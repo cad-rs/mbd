@@ -234,7 +234,7 @@ Cards:
    BUSHING), their potentials; Tier A damped torsional pendulum, static and
    dynamic multi-turn winding, bushing deflection, frequencies, energy.
 
-### M4 Integration surface (kernel-neutral) — proposed
+### M4 Integration surface (kernel-neutral) — **done**
 *Re-scoped 2026-11-15: the crate is a standalone, kernel-neutral library;
 wiring it into any particular CAD kernel or application (rcad included)
 is that consumer's work, in that consumer's repository.* What this crate
@@ -251,6 +251,11 @@ owes every consumer instead:
 - API-stability notes (what is public and versioned).
 Gates: serde goldens of studies and results, the sample adapter running
 in CI, doc examples compiling.
+
+Done (2026-11-15): `study` module (`Study` / `run_study` / `StudyResult`,
+CSV export; card 1) and `docs/INTEGRATING.md` with `examples/adapter.rs`
+(a millimetre CAD-style model → `System`, checked against the closed form
+by `tests/adapter.rs`; card 2).
 
 ### M5 (separate card, not in this roadmap's schedule)
 Joint friction (Stribeck), contact/impact (Chrono/MuJoCo class problems),
