@@ -652,13 +652,13 @@ fn damped_oscillator_three_regimes() {
     }
 }
 
-/// A planar four-bar built from four 3D revolutes (three redundant
-/// equations) swinging under gravity from rest: index 3 keeps the loop
-/// closed, the projected output velocities satisfy the velocity
-/// constraints, and the trapezoidal rule holds the energy.
-#[test]
-fn four_bar_swings_closed_and_conservative() {
-    let (a, b, c, d) = (0.1, 0.3, 0.25, 0.3);
+const FOUR_BAR: (f64, f64, f64, f64) = (0.1, 0.3, 0.25, 0.3);
+
+/// A planar four-bar (crank `a`, coupler `b`, rocker `c`, ground `d`) from
+/// four 3D revolutes about world Z, gravity −Y, authored near crank angle
+/// 90° (the position IC closes the loop).
+fn four_bar() -> System {
+    let (a, b, c, d) = FOUR_BAR;
     let mut sys = System::new("four-bar");
     sys.gravity = Some(DVec3::new(0.0, -G, 0.0));
     sys.add_body(ground()).unwrap();
@@ -690,6 +690,17 @@ fn four_bar_swings_closed_and_conservative() {
     joint(&mut sys, 2, JointKind::Revolute, 4, 5);
     joint(&mut sys, 3, JointKind::Revolute, 6, 8);
     joint(&mut sys, 4, JointKind::Revolute, 2, 7);
+    sys
+}
+
+/// The four-bar (three redundant equations) swinging under gravity from
+/// rest: index 3 keeps the loop closed, the projected output velocities
+/// satisfy the velocity constraints, and the trapezoidal rule holds the
+/// energy.
+#[test]
+fn four_bar_swings_closed_and_conservative() {
+    let (_, b, c, _) = FOUR_BAR;
+    let sys = four_bar();
     // Energy error at two step sizes: bounded (no secular drift) and
     // second order — halving the step quarters it.
     let run = |step: f64| {
@@ -806,4 +817,112 @@ fn integration_is_deterministic_and_validated() {
             .code,
         codes::BAD_TIME_GRID
     );
+}
+
+// ── joint reactions ─────────────────────────────────────────────────────
+
+/// The swinging pendulum's hinge: the force on the ground (marker I) is
+/// `m·g − m·a_com` (the link pulls on the hinge), the force on the link the
+/// opposite, no hinge torque; unique.
+#[test]
+fn pendulum_hinge_reaction() {
+    let mut sys = pendulum(1.1);
+    sys.bodies.get_mut(&BodyId(2)).unwrap().angular_velocity = DVec3::Z * 2.3;
+    let frame = dynamic_ic(&sys, 0.0).unwrap();
+    let r = &frame.reactions(&sys).unwrap()[0];
+    assert_eq!(r.owner, EquationOwner::Joint(JointId(1)));
+    assert!(r.is_unique() && r.effort.is_none());
+    let (v, a) = (frame.velocity[&BodyId(2)], frame.acceleration[&BodyId(2)]);
+    let c = DQuat::from_rotation_z(1.1) * DVec3::new(0.0, -L, 0.0);
+    let a_com = a.linear + a.angular.cross(c) + v.angular.cross(v.angular.cross(c));
+    let g = DVec3::new(0.0, -G, 0.0);
+    close_v(r.force_on_j, M * (a_com - g), 1e-10, "hinge force on the link");
+    close_v(r.force_on_i, -M * (a_com - g), 1e-10, "hinge force on the ground");
+    assert!(r.torque_on_i.length() < 1e-10 && r.torque_on_j.length() < 1e-10);
+}
+
+/// A motor's effort is the torque it applies to the driven body; the
+/// driver's wrench is a pure torque about the joint axis.
+#[test]
+fn driver_effort_is_the_motor_torque() {
+    let mut sys = pendulum(0.0);
+    sys.add_driver(Driver {
+        joint: JointId(1),
+        slot: DriverSlot::Rotation,
+        profile: DriverProfile::Harmonic {
+            offset: 0.3,
+            amplitude: 0.8,
+            frequency_hz: 0.7,
+            phase: 0.2,
+        },
+    });
+    let t = 0.77;
+    let kin = solve_frame(&sys, t, None).unwrap();
+    let frame = forward_dynamics(&sys, t, &kin.state, &kin.velocity).unwrap();
+    let reactions = frame.reactions(&sys).unwrap();
+    let motor = reactions.iter().find(|r| r.owner == EquationOwner::Driver(0)).unwrap();
+    let s = sys.drivers[0].sample(t);
+    let torque = i_hinge() * s.acceleration + M * G * L * s.value.sin();
+    close(motor.effort.unwrap(), torque, 1e-9, "effort");
+    close_v(motor.torque_on_j, DVec3::Z * torque, 1e-9, "torque on the link");
+    assert!(motor.force_on_i.length() < 1e-12);
+    let hinge = reactions.iter().find(|r| r.owner == EquationOwner::Joint(JointId(1))).unwrap();
+    assert!(hinge.torque_on_i.z.abs() < 1e-10, "the hinge carries no axial torque");
+}
+
+/// Static equilibrium reactions: the side-loaded pendulum's hinge carries
+/// the weight plus the push.
+#[test]
+fn static_hinge_reaction() {
+    let mut sys = pendulum(0.0);
+    marker(&mut sys, 3, 2, DVec3::new(0.0, -0.9, 0.0), DQuat::IDENTITY);
+    let push = DVec3::new(7.0, 0.0, 0.0);
+    sys.add_force(ForceElement::AppliedForce {
+        id: ForceId(1),
+        name: "push".into(),
+        marker: MarkerId(3),
+        force: push,
+    })
+    .unwrap();
+    let eq = static_equilibrium(&sys, 0.0, None).unwrap();
+    let r = &eq.reactions(&sys).unwrap()[0];
+    close_v(r.force_on_i, push + DVec3::new(0.0, -M * G, 0.0), 1e-9, "load on the ground");
+    assert!(r.torque_on_i.length() < 1e-9);
+}
+
+/// Redundancy: a coaxial double hinge shares the load in an arbitrary way
+/// — each reaction is flagged indeterminate, yet the two together carry
+/// exactly the hinge load. The planar four-bar of 3D revolutes determines
+/// every in-plane load (Fx, Fy, Tz) of each joint and leaves only the
+/// out-of-plane split indeterminate.
+#[test]
+fn indeterminate_reactions_are_flagged() {
+    let mut sys = pendulum(0.9);
+    marker(&mut sys, 3, 1, DVec3::new(0.0, 0.0, 0.1), DQuat::IDENTITY);
+    marker(&mut sys, 4, 2, DVec3::new(0.0, 0.0, 0.1), DQuat::IDENTITY);
+    joint(&mut sys, 2, JointKind::Revolute, 3, 4);
+    let frame = dynamic_ic(&sys, 0.0).unwrap();
+    let both = frame.reactions(&sys).unwrap();
+    assert!(both.iter().all(|r| !r.is_unique()), "{both:?}");
+    let total: DVec3 = both.iter().map(|r| r.force_on_j).sum();
+    let a = frame.acceleration[&BodyId(2)];
+    let c = DQuat::from_rotation_z(0.9) * DVec3::new(0.0, -L, 0.0);
+    let a_com = a.linear + a.angular.cross(c);
+    close_v(total, M * (a_com - DVec3::new(0.0, -G, 0.0)), 1e-9, "total hinge load");
+
+    let sys = four_bar();
+    let frame = dynamic_ic(&sys, 0.0).unwrap();
+    let reactions = frame.reactions(&sys).unwrap();
+    assert_eq!(reactions.len(), 4);
+    for r in &reactions {
+        assert!(!r.is_unique(), "{:?}", r.owner);
+        for e in &r.indeterminate {
+            assert!(
+                e[0].abs() < 1e-9 && e[1].abs() < 1e-9 && e[5].abs() < 1e-9,
+                "{:?}: in-plane loads must be determinate: {e:?}",
+                r.owner
+            );
+        }
+        assert!(r.torque_on_i.z.abs() < 1e-9, "revolutes carry no axial torque");
+    }
 }

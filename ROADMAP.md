@@ -190,9 +190,11 @@ Cards (one commit each):
    projected output frames) + Tier A time benchmarks (free fall, pendulum
    period + energy, spring-mass ω = √(k/m), damping three regimes, closed
    four-bar energy error second order in h).
-3. **λ recovery = joint reactions** (force/torque at the joint markers,
-   non-unique under redundancy, flagged) + Tier B against OndselSolver's
-   joint reaction series.
+3. **Done** — **λ recovery = joint reactions** (`reaction` module: force
+   on I / torque about marker I, world frame; driver efforts; statically
+   indeterminate directions under redundancy) + Tier B against
+   OndselSolver's joint/motion reaction series on all seven cases (two
+   with gravity): worst 1.4e-10 N.
 4. Variable-step error control + long-run angular-momentum drift audit
    (unloaded system — the industry metric of integrator quality) + docs.
 
@@ -249,7 +251,7 @@ src/
 | Layer | Oracle | Note |
 |---|---|---|
 | **A Analytic closed form** | mathematical truth | free fall a=g; small-angle pendulum period 2π√(l/g) + energy conservation; spring-mass ω=√(k/m); damped oscillation three-regime closed form; crank-slider x=r·cosθ+√(l²−r²sin²θ); four-bar Freudenstein; gear ratio and torque balance ω₁T₁=ω₂T₂; **long-run angular-momentum drift with no external force** (integrator quality metric) |
-| **B OndselSolver reference poses** | `.asmt` samples → independent exe → reference JSON | position/velocity/acceleration levels (all three complete). The gap doc Phase 5 methodology; OndselSolver is local |
+| **B OndselSolver reference poses + reactions** | `.asmt` samples → independent exe → reference JSON | position/velocity/acceleration levels (all three complete) + joint/motion reaction series (inverse dynamics, with gravity; M2). The gap doc Phase 5 methodology; OndselSolver is local |
 | **C Open-source MBD cross-check** | Project Chrono / MuJoCo (Python bindings via uv) | tolerance-level sanity (different integrator/contact paths); cross-check only, no alignment. Introduced from M2 |
 
 Plus: crate-level golden (system serialization bytes stable) and

@@ -37,6 +37,7 @@ pub mod joint;
 pub mod kinematics;
 pub mod measure;
 pub mod merge;
+pub mod reaction;
 mod linalg;
 pub mod system;
 
@@ -59,6 +60,7 @@ pub use kinematics::{
 };
 pub use measure::{JointMotion, MarkerMotion, PointMotion, RelativeMotion};
 pub use merge::{merge_fixed_groups, MergedSystem, Placement};
+pub use reaction::{reactions, Reaction};
 pub use system::{System, STANDARD_GRAVITY};
 
 #[cfg(test)]

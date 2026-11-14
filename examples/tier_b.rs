@@ -18,7 +18,7 @@ mod cases;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use cases::{Reference, PART_SERIES};
+use cases::{Reference, PART_SERIES, REACTION_SERIES};
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -68,7 +68,8 @@ fn reference(dir: &Path, source: &str) -> Result<(), String> {
 }
 
 /// Parse the `TimeSeries` section OndselSolver appends to its output: the
-/// `Time` row and every `PartSeries` block (the first value after each label
+/// `Time` row, every `PartSeries` block and every joint / motion reaction
+/// block (`*JointSeries`, `*MotionSeries`; the first value after each label
 /// is the authored input, skipped).
 fn parse_time_series(text: &str, source: &str) -> Result<Reference, String> {
     let mut lines = text.lines().skip_while(|l| l.trim() != "TimeSeries");
@@ -86,28 +87,40 @@ fn parse_time_series(text: &str, source: &str) -> Result<Reference, String> {
     };
     let mut times = Vec::new();
     let mut parts: BTreeMap<String, Vec<Vec<f64>>> = BTreeMap::new();
-    let mut current: Option<(String, BTreeMap<String, Vec<f64>>)> = None;
-    let flush = |current: &mut Option<(String, BTreeMap<String, Vec<f64>>)>,
-                 parts: &mut BTreeMap<String, Vec<Vec<f64>>>|
+    let mut reactions: BTreeMap<String, Vec<Vec<f64>>> = BTreeMap::new();
+    // The block being read: whether it is a part (else a joint / motion),
+    // its name and its labelled rows.
+    type Block = (bool, String, BTreeMap<String, Vec<f64>>);
+    let mut current: Option<Block> = None;
+    let flush = |current: &mut Option<Block>,
+                 parts: &mut BTreeMap<String, Vec<Vec<f64>>>,
+                 reactions: &mut BTreeMap<String, Vec<Vec<f64>>>|
      -> Result<(), String> {
-        if let Some((name, series)) = current.take() {
-            let n = series.get("X").map_or(0, Vec::len);
-            let mut samples = vec![Vec::with_capacity(18); n];
-            for label in PART_SERIES {
-                let values = series
-                    .get(label)
-                    .ok_or(format!("{name}: missing {label}"))?;
-                if values.len() != n {
-                    return Err(format!(
-                        "{name}: {label} has {} values, X has {n}",
-                        values.len()
-                    ));
-                }
-                for (sample, v) in samples.iter_mut().zip(values) {
-                    sample.push(*v);
-                }
+        let Some((is_part, name, series)) = current.take() else {
+            return Ok(());
+        };
+        let labels: &[&str] = if is_part { &PART_SERIES } else { &REACTION_SERIES };
+        let n = series.get(labels[0]).map_or(0, Vec::len);
+        let mut samples = vec![Vec::with_capacity(labels.len()); n];
+        for label in labels {
+            let values = series
+                .get(*label)
+                .ok_or(format!("{name}: missing {label}"))?;
+            if values.len() != n {
+                return Err(format!(
+                    "{name}: {label} has {} values, {} has {n}",
+                    values.len(),
+                    labels[0]
+                ));
             }
+            for (sample, v) in samples.iter_mut().zip(values) {
+                sample.push(*v);
+            }
+        }
+        if is_part {
             parts.insert(name, samples);
+        } else {
+            reactions.insert(name, samples);
         }
         Ok(())
     };
@@ -120,20 +133,24 @@ fn parse_time_series(text: &str, source: &str) -> Result<Reference, String> {
             continue;
         }
         if line.ends_with("Series") || line.contains("Series\t") || line.contains("Series ") {
-            flush(&mut current, &mut parts)?;
-            if let Some(rest) = line.strip_prefix("PartSeries") {
-                let full = rest.trim();
-                let name = full.rsplit('/').next().unwrap_or(full).to_string();
-                current = Some((name, BTreeMap::new()));
+            flush(&mut current, &mut parts, &mut reactions)?;
+            let mut cells = line.split_whitespace();
+            let kind = cells.next().unwrap_or_default();
+            let full = cells.next().unwrap_or_default();
+            let name = full.rsplit('/').next().unwrap_or(full).to_string();
+            if kind == "PartSeries" {
+                current = Some((true, name, BTreeMap::new()));
+            } else if kind.ends_with("JointSeries") || kind.ends_with("MotionSeries") {
+                current = Some((false, name, BTreeMap::new()));
             }
             continue;
         }
-        if let Some((_, series)) = current.as_mut() {
+        if let Some((_, _, series)) = current.as_mut() {
             let (label, values) = row(line)?;
             series.insert(label, values);
         }
     }
-    flush(&mut current, &mut parts)?;
+    flush(&mut current, &mut parts, &mut reactions)?;
     if times.is_empty() || parts.is_empty() {
         return Err("TimeSeries without times or parts".into());
     }
@@ -141,5 +158,6 @@ fn parse_time_series(text: &str, source: &str) -> Result<Reference, String> {
         source: source.to_string(),
         times,
         parts,
+        reactions,
     })
 }

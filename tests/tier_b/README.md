@@ -31,7 +31,9 @@ systems (`cases.rs`). The references are the committed `<case>.json` files;
                       <dir>/spatial_rsur.asmt           <dir>/spatial_rsur.out.asmt \
                       <dir>/nested_chain.asmt           <dir>/nested_chain.out.asmt \
                       <dir>/primitive_crank_slider.asmt <dir>/primitive_crank_slider.out.asmt \
-                      <dir>/primitive_rsur.asmt         <dir>/primitive_rsur.out.asmt
+                      <dir>/primitive_rsur.asmt         <dir>/primitive_rsur.out.asmt \
+                      <dir>/gravity_rsur.asmt           <dir>/gravity_rsur.out.asmt \
+                      <dir>/gravity_nested_chain.asmt   <dir>/gravity_nested_chain.out.asmt
    cargo run --example tier_b -- reference <dir> "OndselSolver <commit>"
    ```
 
@@ -40,7 +42,9 @@ systems (`cases.rs`). The references are the committed `<case>.json` files;
 
 The committed references come from OndselSolver `09d6175` (2025-01-21),
 release build. Worst deviation from this crate: 3.8e-10 (spatial RSUR
-angular acceleration); everything else ≤ 5e-11.
+angular acceleration); everything else ≤ 5e-11. Reactions: see below.
+The gravity cases and the reaction series were added with M2 card 3 from
+the same build (the earlier cases' part series reproduced byte for byte).
 
 ## OndselSolver quirks met on the way
 
@@ -61,3 +65,15 @@ angular acceleration — all world frame, which is also this crate's `Twist`
 convention. Joint and driver conventions match one to one: both solvers use
 the same direction-cosine joint equations and measure a rotation driver as
 `atan2(xJ·yI, xJ·xI)` unwrapped across turns.
+
+Per joint (`j{id}`) and motion (`d{index}`) and output time: the reaction
+OndselSolver writes (`FXonI … TZonI` — force on marker I's part and torque
+about marker I's origin, world frame; the motion's I marker is the alias at
+the joint's marker 1) against this crate's `Reaction::wrench_on_i` from
+`forward_dynamics` on the kinematic frame (inverse dynamics: the masses and
+gravity are in the export). OndselSolver removes redundant equations, this
+crate reports the minimum-norm multiplier split; the two differ only along
+the reaction's `indeterminate` directions, so the determinate part is
+compared. Worst deviation: 1.4e-10 N force (RSUR, peak 28 N with gravity),
+1.7e-11 N·m torque; the redundant crank-sliders agree to 3.5e-11 N on
+their determinate part.

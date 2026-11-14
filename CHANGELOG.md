@@ -12,6 +12,28 @@
 
 ## Unreleased (M1 + M1.5 complete, M2 in progress)
 
+### M2 card 3 — joint reactions (λ recovery) + Tier B reactions
+
+- `reaction` module: `reactions(sys, time, state, multipliers)` and
+  `DynamicFrame::reactions` / `StaticEquilibrium::reactions` — per joint
+  and driver the force on marker I's body and the torque about marker I's
+  origin (world frame, the OndselSolver / Adams convention), the J side,
+  the driver `effort` along its coordinate, and the statically
+  `indeterminate` wrench directions under redundancy (image of the null
+  space of `Jᵀ`; `is_unique`, `determinate_part`).
+- `.asmt` export now writes constant gravity (force elements still
+  refused).
+- Tier B: the pipeline reads OndselSolver's joint/motion reaction series
+  (`FXonI … TZonI`); two gravity cases (`gravity_rsur`,
+  `gravity_nested_chain`); `tier_b_reactions_match_ondsel` compares inverse
+  dynamics on every frame of all seven cases — worst 1.4e-10 N / 1.7e-11
+  N·m (peak 40 N), redundant crank-sliders on their determinate part.
+  The earlier references' part series reproduced byte for byte.
+- Tier A: pendulum hinge load `m·(a_com − g)`, motor effort = inverse
+  dynamics torque, static hinge load = weight + push, coaxial double hinge
+  (indeterminate split, exact total), planar four-bar (in-plane loads
+  determinate, out-of-plane split flagged).
+
 ### M2 card 2 — index-3 HHT-α integrator
 
 - `integrate` module: `simulate(sys, times, &HhtSettings)` — dynamic IC at
@@ -163,6 +185,5 @@
 
 ### Next
 
-- M2 card 3: λ recovery as joint reactions (force/torque at the joint
-  markers, non-unique under redundancy) + Tier B against OndselSolver's
-  joint reaction series.
+- M2 card 4: variable-step local error control for HHT-α, the long-run
+  angular-momentum drift audit of an unloaded system, M2 close-out docs.

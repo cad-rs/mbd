@@ -1,6 +1,7 @@
-//! Tier B (roadmap §6): `kinematic_sweep` against OndselSolver reference
-//! trajectories. The references (`tests/tier_b/<case>.json`) are produced
-//! offline by an independent OndselSolver build from the `.asmt` export of
+//! Tier B (roadmap §6): `kinematic_sweep` and the joint reactions against
+//! OndselSolver reference trajectories and reaction series. The references
+//! (`tests/tier_b/<case>.json`) are produced offline by an independent
+//! OndselSolver build from the `.asmt` export of
 //! the same systems (`examples/tier_b.rs`, `tests/tier_b/README.md`).
 
 #[path = "tier_b/cases.rs"]
@@ -103,6 +104,54 @@ fn tier_b_matches_ondsel() {
         );
     }
 }
+
+/// Joint and driver reactions (λ recovery, inverse dynamics on the
+/// kinematic frames) against OndselSolver's `FXonI … TZonI` series: the
+/// force on marker I's part and the torque about marker I, world frame.
+/// Under redundancy only the determinate part is compared — OndselSolver
+/// removes redundant equations, this crate reports the minimum-norm split;
+/// valid splits differ only along the reported indeterminate directions.
+#[test]
+fn tier_b_reactions_match_ondsel() {
+    for case in cases::all() {
+        let reference = load(case.name);
+        assert!(!reference.reactions.is_empty(), "{}: no reaction series", case.name);
+        let frames = kinematic_sweep(&case.system, &reference.times).unwrap();
+        let (mut worst_f, mut worst_t, mut peak) = (0.0_f64, 0.0_f64, 0.0_f64);
+        let mut indeterminate = 0;
+        for (k, frame) in frames.iter().enumerate() {
+            let dynamic = forward_dynamics(&case.system, frame.time, &frame.state, &frame.velocity).unwrap();
+            for r in dynamic.reactions(&case.system).unwrap() {
+                let key = match r.owner {
+                    EquationOwner::Joint(id) => format!("j{}", id.0),
+                    EquationOwner::Driver(i) => format!("d{i}"),
+                    EquationOwner::Coupler(_) => unreachable!("no couplers in Tier B"),
+                };
+                let s = &reference.reactions[&key][k];
+                let ours = r.wrench_on_i();
+                let diff: Vec<f64> = ours.iter().zip(s).map(|(a, b)| a - b).collect();
+                let d = r.determinate_part(diff.try_into().unwrap());
+                worst_f = worst_f.max(DVec3::new(d[0], d[1], d[2]).length());
+                worst_t = worst_t.max(DVec3::new(d[3], d[4], d[5]).length());
+                peak = peak.max(r.force_on_i.length());
+                if !r.is_unique() && k == 0 {
+                    indeterminate += 1;
+                }
+            }
+        }
+        println!(
+            "{}: worst |Δ| force {worst_f:.2e} N, torque {worst_t:.2e} N·m (peak force {peak:.3} N, {indeterminate} indeterminate)",
+            case.name
+        );
+        assert!(worst_f < REACTION_LIMITS[0], "{}: force differs by {worst_f:e}", case.name);
+        assert!(worst_t < REACTION_LIMITS[1], "{}: torque differs by {worst_t:e}", case.name);
+    }
+}
+
+/// Observed (OndselSolver 09d6175, release): worst force 1.4e-10 N
+/// (spatial / gravity RSUR, peak 28 N), torque 1.7e-11 N·m; the limits keep
+/// >= 25x headroom.
+const REACTION_LIMITS: [f64; 2] = [5e-9, 5e-10];
 
 /// Rigid-group merging: the nested chain's arm is welded to its carriage.
 /// Merged (one body, six coordinates and six equations fewer), solved, and

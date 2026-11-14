@@ -6,7 +6,10 @@
 //! Chosen to cover what Tier A does not: an offset slider, a spatial loop
 //! (non-parallel pivot axes, spherical + universal), and a nested open chain
 //! with two drivers on one cylindrical joint, a fixed joint and a prismatic
-//! joint sliding in a rotating frame (Coriolis terms).
+//! joint sliding in a rotating frame (Coriolis terms); two of them again
+//! under gravity for the reaction series (every case doubles as an inverse
+//! dynamics reference: OndselSolver writes each joint's and motion's
+//! reaction).
 
 #![allow(dead_code)]
 
@@ -26,6 +29,8 @@ pub fn all() -> Vec<Case> {
         nested_chain(),
         primitive_crank_slider(),
         primitive_rsur(),
+        gravity_rsur(),
+        gravity_nested_chain(),
     ]
 }
 
@@ -322,4 +327,31 @@ pub struct Reference {
     pub source: String,
     pub times: Vec<f64>,
     pub parts: std::collections::BTreeMap<String, Vec<Vec<f64>>>,
+    /// Per joint (`j{id}`) and motion (`d{index}`): one I-side reaction
+    /// sample per time, in [`REACTION_SERIES`] order.
+    #[serde(default)]
+    pub reactions: std::collections::BTreeMap<String, Vec<Vec<f64>>>,
+}
+
+/// The reaction series OndselSolver writes per joint and motion: force on
+/// the I marker's part and torque about the I marker origin, world frame.
+pub const REACTION_SERIES: [&str; 6] = ["FXonI", "FYonI", "FZonI", "TXonI", "TYonI", "TZonI"];
+
+/// The spatial RSUR under gravity (−Y): every joint and the motor carry the
+/// weight on top of the inertial loads.
+fn gravity_rsur() -> Case {
+    let mut case = spatial_rsur();
+    case.system.gravity = Some(DVec3::new(0.0, -STANDARD_GRAVITY, 0.0));
+    case.name = "gravity_rsur";
+    case
+}
+
+/// The nested chain under gravity (−Z, along the cylindrical axis): the
+/// stroke driver lifts the whole chain, the slider's driver works against
+/// the tilted arm.
+fn gravity_nested_chain() -> Case {
+    let mut case = nested_chain();
+    case.system.gravity = Some(DVec3::new(0.0, 0.0, -STANDARD_GRAVITY));
+    case.name = "gravity_nested_chain";
+    case
 }

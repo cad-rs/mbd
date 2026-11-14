@@ -22,7 +22,9 @@
 //! Verified against an OndselSolver build (Tier B, `tests/tier_b.rs`): the
 //! exported cases agree with this crate's kinematics to ≤ 4e-10.
 //!
-//! Export only, kinematic subset: no force elements, no gravity.
+//! Export only: the kinematic subset plus constant gravity (the joint and
+//! motion reaction series OndselSolver writes then carry the gravity load —
+//! the Tier B reference for reaction recovery). No force elements.
 
 use std::fmt::Write as _;
 
@@ -54,14 +56,14 @@ fn part_name(body: &Body) -> String {
 /// Refused as [`codes::ASMT_UNSUPPORTED`]: a body inertia that is not
 /// diagonal in the body axes (principal axes are not derived here), a
 /// driver profile without a closed-form expression (keyframes, step,
-/// spline), force elements and gravity, and couplers (OndselSolver's gear /
+/// spline), force elements, and couplers (OndselSolver's gear /
 /// rack-pinion / screw joints relate two markers directly, not joint
 /// coordinates, so there is no faithful one-to-one mapping).
 pub fn write_asmt(sys: &System, sim: &AsmtSimulation) -> Result<String, MbdError> {
     sys.validate()?;
-    if !sys.forces.is_empty() || sys.gravity.is_some_and(|g| g != DVec3::ZERO) {
+    if !sys.forces.is_empty() {
         return Err(unsupported(
-            "force elements and gravity are not exported (kinematic subset)",
+            "force elements are not exported (kinematic subset plus gravity)",
         ));
     }
     if !sys.couplers.is_empty() {
@@ -218,7 +220,7 @@ pub fn write_asmt(sys: &System, sim: &AsmtSimulation) -> Result<String, MbdError
     line(w, 2, "GeneralConstraintSets");
     line(w, 1, "ForceTorques");
     line(w, 1, "ConstantGravity");
-    line(w, 2, &vector(DVec3::ZERO));
+    line(w, 2, &vector(sys.gravity.unwrap_or(DVec3::ZERO)));
 
     line(w, 1, "SimulationParameters");
     for (key, value) in [
