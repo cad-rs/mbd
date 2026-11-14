@@ -61,8 +61,11 @@ use crate::dynamics::{
     applied_forces, dynamic_ic, flatten, inertias, output_frame, retract, slot_twists, DynamicFrame,
 };
 use crate::error::{codes, MbdError};
-use crate::kinematics::{KinematicState, Problem};
+use std::collections::BTreeSet;
+
+use crate::kinematics::{joint_slots, KinematicState, Problem, BODY_TWIST};
 use crate::linalg::RowFactor;
+use crate::sparse::{SaddleFactor, SparseRows, Triplets};
 use crate::system::System;
 
 /// The Adams default HHT α.
@@ -185,17 +188,84 @@ struct Eval {
     phi: f64,
     params: Vec<f64>,
     v: Vec<f64>,
-    j: Vec<Vec<f64>>,
+    j: SparseRows,
 }
 
 fn inf_norm(x: &[f64]) -> f64 {
     x.iter().fold(0.0, |m, v| m.max(v.abs()))
 }
 
+/// Column groups for the forward-difference iteration matrix: a
+/// distance-2 colouring of the body coupling graph (two bodies are coupled
+/// when one joint, coupler, driver or force element involves both). The
+/// dynamic rows of body `s` depend only on the accelerations of `s` and its
+/// neighbours, so bodies more than two links apart can be perturbed in one
+/// residual evaluation and every row still sees one perturbed column —
+/// the same differences as perturbing column by column (Curtis–Powell–Reid).
+/// A chain needs three colours, whatever its length.
+pub(crate) struct Coloring {
+    /// Free body slots per colour.
+    groups: Vec<Vec<usize>>,
+    /// Closed neighbourhood of every slot (itself included).
+    neighbors: Vec<Vec<usize>>,
+}
+
+impl Coloring {
+    pub(crate) fn new(problem: &Problem) -> Self {
+        let sys = problem.sys;
+        let n = problem.n_bodies();
+        let mut adj: Vec<BTreeSet<usize>> = (0..n).map(|s| BTreeSet::from([s])).collect();
+        let mut couple = |slots: &[usize]| {
+            for &a in slots {
+                for &b in slots {
+                    adj[a].insert(b);
+                }
+            }
+        };
+        for group in &problem.groups {
+            couple(&group.slots);
+        }
+        for element in sys.forces.values() {
+            let mut slots: Vec<usize> = element
+                .markers()
+                .iter()
+                .map(|m| problem.slot_of[&sys.markers[m].body])
+                .collect();
+            if let Some((joint, _)) = element.measured_joint() {
+                slots.extend(joint_slots(sys, &problem.slot_of, joint));
+            }
+            couple(&slots);
+        }
+        let free = |s: usize| problem.col_of[s].is_some();
+        let mut color = vec![usize::MAX; n];
+        let mut groups: Vec<Vec<usize>> = Vec::new();
+        for t in (0..n).filter(|&t| free(t)) {
+            // Conflicts: bodies sharing a row-carrying (free) neighbour.
+            let used: BTreeSet<usize> = adj[t]
+                .iter()
+                .filter(|&&s| free(s))
+                .flat_map(|&s| adj[s].iter().map(|&u| color[u]))
+                .filter(|&c| c != usize::MAX)
+                .collect();
+            let c = (0..).find(|c| !used.contains(c)).expect("a free colour");
+            color[t] = c;
+            if c == groups.len() {
+                groups.push(Vec::new());
+            }
+            groups[c].push(t);
+        }
+        Self {
+            groups,
+            neighbors: adj.into_iter().map(|s| s.into_iter().collect()).collect(),
+        }
+    }
+}
+
 /// One step attempt from `from` to `problem.time`.
 struct Step<'s, 'a> {
     problem: &'s Problem<'a>,
     from: &'s Point,
+    coloring: &'s Coloring,
     h: f64,
     alpha: f64,
     beta: f64,
@@ -245,13 +315,13 @@ impl Step<'_, '_> {
                 n.angular -= ma.angular + b.angular;
             }
         }
-        let j = problem.jacobian(&params);
-        let mut r: Vec<f64> = flatten(problem, &net).iter().map(|v| -v).collect();
-        for (row, l) in j.iter().zip(lambda) {
-            for (ri, ji) in r.iter_mut().zip(row) {
-                *ri += ji * l;
-            }
-        }
+        let j = problem.jacobian_sparse(&params);
+        let jt_lambda = j.t_mul(lambda);
+        let mut r: Vec<f64> = flatten(problem, &net)
+            .iter()
+            .zip(&jt_lambda)
+            .map(|(q, c)| c - q)
+            .collect();
         let mut phi = vec![0.0; problem.rows.len()];
         problem.constraint_residuals(&params, &mut phi);
         let scale = 1.0 / ((1.0 + self.alpha) * self.beta * self.h * self.h);
@@ -265,11 +335,68 @@ impl Step<'_, '_> {
         })
     }
 
-    /// The iteration matrix at `(x, λ)`: `[∂r/∂q̈ Jᵀ; J 0]`.
-    fn matrix(&self, x: &[f64], lambda: &[f64], base: &Eval) -> Result<RowFactor, MbdError> {
+    /// The iteration matrix at `(x, λ)`: `[∂r/∂q̈ Jᵀ; J 0]`. `∂r/∂q̈` by
+    /// forward differences, one residual evaluation per colour group and
+    /// direction ([`Coloring`]).
+    fn matrix(&self, x: &[f64], lambda: &[f64], base: &Eval) -> Result<Factor, MbdError> {
         let n = x.len();
-        let m = base.j.len();
-        let mut rows = vec![vec![0.0; n + m]; n + m];
+        let a = self.fd_triplets(x, lambda, base)?;
+        // Sparse quasi-definite LDLᵀ of the symmetric part (a modified-Newton
+        // matrix may be approximate); the dense QR when it declines.
+        let sparse = SaddleFactor::new(n, &a, &base.j);
+        if let Some(f) = sparse {
+            return Ok(Factor::Sparse(f));
+        }
+        let mut dense = vec![vec![0.0; n]; n];
+        for (r, c, v) in a {
+            dense[r][c] += v;
+        }
+        let rows = self.with_constraints(dense, base);
+        Ok(Factor::Dense(RowFactor::new(&rows, rows.len())))
+    }
+
+    /// The entries of `∂r/∂q̈` (`n × n`) by coloured forward differences.
+    fn fd_triplets(&self, x: &[f64], lambda: &[f64], base: &Eval) -> Result<Triplets, MbdError> {
+        let mut entries = Vec::new();
+        let col_of = &self.problem.col_of;
+        for group in &self.coloring.groups {
+            for dir in 0..BODY_TWIST {
+                let mut trial = x.to_vec();
+                let mut columns = Vec::with_capacity(group.len());
+                for &t in group {
+                    let c = col_of[t].expect("free slot") + dir;
+                    let eps = FD_STEP * (1.0 + x[c].abs());
+                    trial[c] = x[c] + eps;
+                    columns.push((t, c, eps));
+                }
+                let e = self.eval(&trial, lambda)?;
+                for (t, c, eps) in columns {
+                    for &s in &self.coloring.neighbors[t] {
+                        let Some(rb) = col_of[s] else { continue };
+                        for r in rb..rb + BODY_TWIST {
+                            let v = (e.r[r] - base.r[r]) / eps;
+                            if v != 0.0 {
+                                entries.push((r, c, v));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(entries)
+    }
+
+    /// The column-by-column forward-difference matrix — the reference the
+    /// coloured one must reproduce.
+    #[cfg(test)]
+    fn fd_rows_full(
+        &self,
+        x: &[f64],
+        lambda: &[f64],
+        base: &Eval,
+    ) -> Result<Vec<Vec<f64>>, MbdError> {
+        let n = x.len();
+        let mut rows = vec![vec![0.0; n]; n];
         let mut trial = x.to_vec();
         for c in 0..n {
             let eps = FD_STEP * (1.0 + x[c].abs());
@@ -280,13 +407,30 @@ impl Step<'_, '_> {
                 row[c] = (ri - bi) / eps;
             }
         }
-        for (k, jr) in base.j.iter().enumerate() {
+        Ok(rows)
+    }
+
+    /// The full `[A Jᵀ; J 0]` rows from the dense `A` (the dense fallback).
+    fn with_constraints(&self, a: Vec<Vec<f64>>, base: &Eval) -> Vec<Vec<f64>> {
+        let n = self.problem.n_cols;
+        let m = base.j.len();
+        let mut rows: Vec<Vec<f64>> = a
+            .into_iter()
+            .map(|mut r| {
+                r.resize(n + m, 0.0);
+                r
+            })
+            .collect();
+        rows.resize(n + m, vec![0.0; n + m]);
+        let j = base.j.to_dense();
+        for (k, jr) in j.iter().enumerate() {
             for (i, row) in rows.iter_mut().enumerate().take(n) {
                 row[n + k] = jr[i];
             }
             rows[n + k][..n].copy_from_slice(jr);
         }
-        Ok(RowFactor::new(&rows, n + m))
+        debug_assert_eq!(rows.len(), n + m);
+        rows
     }
 }
 
@@ -295,12 +439,28 @@ impl Step<'_, '_> {
 /// and damping terms do, so it stays a good modified-Newton matrix across
 /// step-size changes; slow convergence or a failed step rebuilds it.
 struct Cache {
-    factor: RowFactor,
+    factor: Factor,
+}
+
+/// A factored iteration matrix.
+enum Factor {
+    Sparse(SaddleFactor),
+    Dense(RowFactor),
+}
+
+impl Factor {
+    fn solve(&self, rhs: &[f64]) -> Vec<f64> {
+        match self {
+            Factor::Sparse(f) => f.solve_approx(rhs),
+            Factor::Dense(f) => f.solve(rhs).0,
+        }
+    }
 }
 
 /// Attempt one step; `None` when Newton does not converge.
 fn take_step(
     problem: &Problem,
+    coloring: &Coloring,
     from: &Point,
     h: f64,
     settings: &HhtSettings,
@@ -311,6 +471,7 @@ fn take_step(
     let step = Step {
         problem,
         from,
+        coloring,
         h,
         alpha,
         beta: (1.0 - alpha) * (1.0 - alpha) / 4.0,
@@ -333,7 +494,7 @@ fn take_step(
         let ev = step.eval(&a, &lambda)?;
         let rhs: Vec<f64> = ev.r.iter().map(|v| -v).collect();
         let factor = &cache.as_ref().expect("built above").factor;
-        let (dx, _) = factor.solve(&rhs);
+        let dx = factor.solve(&rhs);
         stats.newton_iterations += 1;
         if dx.iter().any(|v| !v.is_finite()) {
             return Ok(None);
@@ -486,6 +647,7 @@ pub fn simulate(
     let mut frames = vec![first];
     let mut stats = IntegrationStats::default();
     let mut cache: Option<Cache> = None;
+    let coloring = Coloring::new(&Problem::new(sys, times[0], &point.state.angles));
     // The controller's step (fixed step: the nominal one).
     let mut h_ctrl = settings.step;
     for &target in &times[1..] {
@@ -508,8 +670,9 @@ pub fn simulate(
                 let t1 = if landing { target } else { point.time + h };
                 let h_step = t1 - point.time;
                 let problem = Problem::new(sys, t1, &point.state.angles);
-                let Some(next) =
-                    take_step(&problem, &point, h_step, settings, &mut cache, &mut stats)?
+                let Some(next) = take_step(
+                    &problem, &coloring, &point, h_step, settings, &mut cache, &mut stats,
+                )?
                 else {
                     stats.rejected += 1;
                     cache = None;
@@ -560,4 +723,141 @@ pub fn simulate(
         frames.push(frame);
     }
     Ok(Simulation { frames, stats })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::body::{Body, BodyId, Marker, MarkerId};
+    use crate::driver::DriverSlot;
+    use crate::force::{Argument, ForceElement, ForceId, Function};
+    use crate::joint::{Joint, JointId, JointKind};
+    use glam::{DMat3, DQuat, DVec3};
+
+    /// A six-link chain with cross-coupling force elements (a line spring
+    /// between links 2 and 5, a torque on link 6 measuring joint 1's rate,
+    /// a joint spring): the coloured forward-difference rows equal the
+    /// column-by-column ones exactly, with few colours.
+    #[test]
+    fn coloured_differences_match_full() {
+        let mut sys = System::new("chain");
+        sys.gravity = Some(DVec3::new(0.0, -9.81, 0.0));
+        let body = |id: u64, grounded: bool| Body {
+            id: BodyId(id),
+            name: format!("b{id}"),
+            mass_kg: if grounded { 0.0 } else { 1.0 + 0.1 * id as f64 },
+            com: DVec3::new(0.0, -0.1, 0.02),
+            inertia_com: DMat3::from_diagonal(DVec3::new(0.01, 0.002, 0.012)),
+            translation: DVec3::new(0.0, -0.2 * id as f64, 0.0),
+            rotation: DQuat::from_rotation_z(0.1 * id as f64),
+            grounded,
+            velocity: DVec3::ZERO,
+            angular_velocity: DVec3::new(0.0, 0.0, 0.3 * id as f64),
+        };
+        sys.add_body(body(0, true)).unwrap();
+        for i in 1..=6u64 {
+            sys.add_body(body(i, false)).unwrap();
+            for (m, b, y) in [
+                (2 * i - 1, i - 1, if i == 1 { 0.0 } else { -0.2 }),
+                (2 * i, i, 0.0),
+            ] {
+                sys.add_marker(Marker {
+                    id: MarkerId(m),
+                    name: format!("m{m}"),
+                    body: BodyId(b),
+                    translation: DVec3::new(0.0, y, 0.0),
+                    rotation: DQuat::IDENTITY,
+                })
+                .unwrap();
+            }
+            sys.add_joint(Joint {
+                id: JointId(i),
+                name: format!("j{i}"),
+                kind: if i == 4 {
+                    JointKind::Spherical
+                } else {
+                    JointKind::Revolute
+                },
+                marker1: MarkerId(2 * i - 1),
+                marker2: MarkerId(2 * i),
+                suppressed: false,
+            })
+            .unwrap();
+        }
+        sys.add_force(ForceElement::SpringDamper {
+            id: ForceId(1),
+            name: "cross".into(),
+            marker1: MarkerId(4),
+            marker2: MarkerId(10),
+            stiffness: 50.0,
+            damping: 2.0,
+            free_length: 0.5,
+            preload: 0.0,
+        })
+        .unwrap();
+        sys.add_force(ForceElement::Torque {
+            id: ForceId(2),
+            name: "rate".into(),
+            marker: MarkerId(12),
+            reference: None,
+            direction: DVec3::Z,
+            magnitude: Function::linear(
+                Argument::JointRate {
+                    joint: JointId(1),
+                    slot: DriverSlot::Rotation,
+                },
+                0.0,
+                -0.5,
+            ),
+        })
+        .unwrap();
+        sys.add_force(ForceElement::JointSpringDamper {
+            id: ForceId(3),
+            name: "hinge spring".into(),
+            joint: JointId(2),
+            slot: DriverSlot::Rotation,
+            stiffness: 4.0,
+            damping: 0.1,
+            free_value: 0.0,
+            preload: 0.0,
+        })
+        .unwrap();
+        let first = dynamic_ic(&sys, 0.0).unwrap();
+        let problem = Problem::new(&sys, 0.0, &first.state.angles);
+        let coloring = Coloring::new(&problem);
+        let v = flatten(&problem, &slot_twists(&problem, &first.velocity));
+        let a = flatten(&problem, &slot_twists(&problem, &first.acceleration));
+        let lambda: Vec<f64> = first.multipliers.iter().map(|(_, l)| *l).collect();
+        let point = Point {
+            time: 0.0,
+            state: first.state.clone(),
+            v,
+            aux: a.clone(),
+            acc: a.clone(),
+            lambda: lambda.clone(),
+        };
+        let next = Problem::new(&sys, 1e-3, &first.state.angles);
+        let step = Step {
+            problem: &next,
+            from: &point,
+            coloring: &coloring,
+            h: 1e-3,
+            alpha: -0.3,
+            beta: 1.69 / 4.0,
+            gamma: 0.8,
+        };
+        let base = step.eval(&a, &lambda).unwrap();
+        let n = a.len();
+        let mut coloured = vec![vec![0.0; n]; n];
+        for (r, c, v) in step.fd_triplets(&a, &lambda, &base).unwrap() {
+            coloured[r][c] += v;
+        }
+        let full = step.fd_rows_full(&a, &lambda, &base).unwrap();
+        assert_eq!(coloured, full);
+        assert!(
+            coloring.groups.len() < 6,
+            "{} colours for 6 links",
+            coloring.groups.len()
+        );
+    }
 }

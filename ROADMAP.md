@@ -68,8 +68,13 @@ engines), hybrid. **Maximal coordinates chosen**, because:
    commercially usable.
 
 Costs (recorded honestly): constraint drift needs stabilization; the
-Jacobian is dense (slow past ~100 bodies) — performance work (sparsification
-/ body partitioning) is a post-M2 channel, not an early milestone.
+Jacobian was dense (slow past ~100 bodies) — the post-M2 performance
+channel (**done**, after M3) made the per-step work sparse: owner-local
+Jacobian, coloured differences for the iteration matrix, a sparse LDLᵀ of
+the saddle-point systems with a constrained minimum-degree ordering (dense
+rank-revealing QR as the diagnosing fallback). A 100-body chain simulates
+one second in ≈ 2.3 s, 200 bodies in ≈ 6 s (`examples/scaling.rs`); one-off
+analyses (`diagnose`, static equilibrium, reactions) stay dense.
 
 State representation: position = translation + unit quaternion (same manifold
 as gcs); velocity/acceleration = translational + angular, **fixed at M1 to the

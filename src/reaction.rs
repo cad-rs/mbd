@@ -12,7 +12,9 @@
 //!
 //! **Redundancy.** With redundant equations the multipliers are not unique:
 //! any `λ + n` with `Jᵀn = 0` satisfies the equations of motion. The
-//! reported reactions are the minimum-norm split, and each reaction lists
+//! reported reactions follow the multipliers' split (redundant equations
+//! removed on the sparse path, minimum-norm on the dense one), and each
+//! reaction lists
 //! the wrench directions along which that split is arbitrary (the image of
 //! the null space of `Jᵀ` on that joint). A planar loop of 3D revolutes,
 //! for example, determines every in-plane load but not how the out-of-plane

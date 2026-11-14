@@ -41,6 +41,7 @@ pub mod measure;
 pub mod merge;
 pub mod reaction;
 mod linalg;
+mod sparse;
 pub mod system;
 
 pub use asmt::{write_asmt, AsmtSimulation};

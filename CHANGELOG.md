@@ -10,7 +10,40 @@
   validation gates; serde golden round-trip tests.
 - Dependency on `rcad-gcs` declared for the M1 position-level solver.
 
-## Unreleased (M1 + M1.5 + M2 + M3 complete)
+## Unreleased (M1 + M1.5 + M2 + M3 complete, performance channel)
+
+### Performance — sparse dynamics and kinematics
+
+`examples/scaling.rs` (N-link pendulum chain under gravity, one simulated
+second, default settings): 40 bodies 88 s → 0.7 s; 100 bodies ≈ 2.3 s,
+200 bodies ≈ 6 s; dynamic IC at 200 bodies 5.1 s → 9 ms. Step counts and
+energy drift are unchanged (the arithmetic of every step is the same up to
+the linear solver).
+
+- Owner-local constraint Jacobian (`Problem::jacobian_sparse`): each joint /
+  coupler / driver is differentiated along its own bodies only — O(rows)
+  jets instead of O(rows × coordinates), entry-for-entry equal to the old
+  assembly (unit test).
+- Coloured forward differences for the HHT iteration matrix: a distance-2
+  colouring of the body coupling graph (joints, couplers, drivers, force
+  elements) perturbs non-interfering bodies together — three colours for
+  a chain of any length; bit-for-bit equal to column-by-column differences
+  (unit test).
+- `sparse` module: sparse LDLᵀ (Davis' LDL: elimination tree, up-looking
+  numeric factorization) of the saddle-point systems `[A Jᵀ; J 0]` with a
+  constrained minimum-degree ordering (a constraint row only after the
+  bodies it touches), linear fill for chains and trees (regression test);
+  redundant rows are removed on the spot (multiplier 0, the Adams /
+  OndselSolver convention; the dense fallback keeps the minimum-norm
+  split); iterative refinement against the unshifted matrix; whatever it
+  cannot settle (conflicts, unresisted loads, an indefinite iteration
+  matrix) falls back to the dense rank-revealing QR, which still names the
+  offending equations. Used by forward dynamics, the velocity IC, output
+  projection, the integrator, the kinematic velocity / acceleration levels
+  (minimum-norm solves with `A = I`) and a new sparse minimum-norm position
+  Newton (backtracking; the `rcad-gcs` dense Newton remains the fallback).
+- Still dense: `diagnose`, `static_equilibrium`, `reactions` (null-space
+  analysis) — one-off analyses, not per-step work.
 
 ### M3 card 2 — joint spring-dampers, bushings (M3 complete)
 
@@ -260,5 +293,5 @@
 
 ### Next
 
-- Performance: sparse / structured constraint Jacobian, analytic iteration
-  matrix, scaling benchmarks past ~100 bodies.
+- M4 assembly-domain wiring (assembly → mbd system conversion, study
+  results to the tool surface).

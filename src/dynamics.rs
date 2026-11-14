@@ -29,11 +29,13 @@
 //! accelerations: dynamics and kinematics share one constraint formulation.
 //!
 //! **Linear solves.** The instantaneous problems are saddle-point systems
-//! `[M Jᵀ; J 0]`, solved through the crate's rank-revealing factorization:
-//! redundant constraint equations are consistent dependent rows — their
-//! multipliers are not unique, and the minimum-norm split is reported
-//! (with the equations listed); inconsistent rows are a singular
-//! configuration and fail as data.
+//! `[M Jᵀ; J 0]`, solved by the sparse quasi-definite LDLᵀ ([`crate::sparse`],
+//! O(bodies) for chains and trees) with the dense rank-revealing QR as the
+//! fallback: redundant constraint equations are consistent dependent rows —
+//! their multipliers are not unique; the sparse path removes them
+//! (multiplier 0, the Adams / OndselSolver convention), the dense path
+//! reports the minimum-norm split, and either way the equations are listed;
+//! inconsistent rows are a singular configuration and fail as data.
 
 use std::collections::BTreeMap;
 
@@ -47,6 +49,7 @@ use crate::kinematics::{
     KinematicState, Problem, Twist, BODY_PARAMS, BODY_TWIST,
 };
 use crate::linalg::RowFactor;
+use crate::sparse::{triplets_from_dense, SaddleFactor, SparseRows, Triplets};
 use crate::system::System;
 
 /// Below this length (m) a spring's line of action is undefined.
@@ -167,8 +170,9 @@ pub struct DynamicFrame {
     /// actuator effort it takes to impose its motion.
     pub multipliers: Vec<(EquationRef, f64)>,
     /// Redundant equations (dependent but consistent): the multipliers of
-    /// the equations they depend on are not unique — the minimum-norm split
-    /// is reported.
+    /// the equations they depend on are not unique — one valid split is
+    /// reported (see the module notes; [`crate::reactions`] lists the
+    /// indeterminate directions).
     pub redundant: Vec<EquationRef>,
 }
 
@@ -182,7 +186,7 @@ pub struct StaticEquilibrium {
     /// its joint at the prescribed value — the "unknown force" of
     /// Inventor / the static motor load of Creo.
     pub multipliers: Vec<(EquationRef, f64)>,
-    /// Redundant equations (non-unique multipliers, minimum-norm split).
+    /// Redundant equations (non-unique multipliers; one valid split).
     pub redundant: Vec<EquationRef>,
     /// Newton iterations taken.
     pub iterations: usize,
@@ -614,10 +618,49 @@ fn solve_saddle(
     bottom: &[f64],
     what: &str,
 ) -> Result<(Vec<f64>, Vec<f64>), MbdError> {
+    let j = SparseRows::from_dense(j, problem.n_cols);
+    solve_saddle_full(problem, &triplets_from_dense(a), &j, top, bottom, what).map(|s| (s.x, s.mu))
+}
+
+/// A saddle-point solution with the redundant constraint rows (ascending).
+pub(crate) struct SaddleSolution {
+    pub(crate) x: Vec<f64>,
+    pub(crate) mu: Vec<f64>,
+    pub(crate) redundant: Vec<usize>,
+}
+
+/// [`solve_saddle`] with the redundancy: the sparse quasi-definite
+/// factorization ([`SaddleFactor`]) first; the dense rank-revealing QR when
+/// the sparse path declines (a matrix that is not quasi-definite, an
+/// inconsistent or singular system — the dense path then names the
+/// offending equations).
+fn solve_saddle_full(
+    problem: &Problem,
+    a: &[(usize, usize, f64)],
+    j: &SparseRows,
+    top: &[f64],
+    bottom: &[f64],
+    what: &str,
+) -> Result<SaddleSolution, MbdError> {
+    if let Some(factor) = SaddleFactor::new(problem.n_cols, a, j) {
+        if let Some((x, mu)) = factor.solve(top, bottom) {
+            return Ok(SaddleSolution {
+                x,
+                mu,
+                redundant: factor.redundant().to_vec(),
+            });
+        }
+    }
     let n = problem.n_cols;
     let m = j.len();
+    let mut a_dense = vec![vec![0.0; n]; n];
+    for &(r, c, v) in a {
+        a_dense[r][c] += v;
+    }
+    let j = j.to_dense();
+    let j = j.as_slice();
     let mut rows = Vec::with_capacity(n + m);
-    for (i, a_row) in a.iter().enumerate() {
+    for (i, a_row) in a_dense.iter().enumerate() {
         let mut row = a_row.clone();
         row.extend(j.iter().map(|jr| jr[i]));
         rows.push(row);
@@ -655,23 +698,29 @@ fn solve_saddle(
         ));
     }
     let (x, mu) = x.split_at(n);
-    Ok((x.to_vec(), mu.to_vec()))
+    Ok(SaddleSolution {
+        x: x.to_vec(),
+        mu: mu.to_vec(),
+        redundant: sorted_dependent(j, n),
+    })
 }
 
 /// The block-diagonal mass matrix as dense rows.
-fn mass_rows(problem: &Problem, inertia: &[Option<BodyInertia>]) -> Vec<Vec<f64>> {
-    let n = problem.n_cols;
-    let mut rows = vec![vec![0.0; n]; n];
+fn mass_triplets(problem: &Problem, inertia: &[Option<BodyInertia>]) -> Triplets {
+    let mut t = Vec::with_capacity(problem.n_cols * BODY_TWIST);
     for (slot, col) in problem.col_of.iter().enumerate() {
         let (Some(b), Some(inertia)) = (*col, inertia[slot]) else {
             continue;
         };
-        let m = inertia.matrix();
-        for (i, mrow) in m.iter().enumerate() {
-            rows[b + i][b..b + BODY_TWIST].copy_from_slice(mrow);
+        for (i, mrow) in inertia.matrix().iter().enumerate() {
+            for (k, v) in mrow.iter().enumerate() {
+                if *v != 0.0 {
+                    t.push((b + i, b + k, *v));
+                }
+            }
         }
     }
-    rows
+    t
 }
 
 pub(crate) fn sorted_dependent(j: &[Vec<f64>], n: usize) -> Vec<usize> {
@@ -681,11 +730,12 @@ pub(crate) fn sorted_dependent(j: &[Vec<f64>], n: usize) -> Vec<usize> {
 }
 
 /// The forward-dynamics solve: per-slot accelerations, the multipliers and
-/// the constraint Jacobian they were solved against.
+/// the redundant rows.
 pub(crate) struct Accelerations {
     pub(crate) acc: Vec<Twist>,
     pub(crate) lambda: Vec<f64>,
-    pub(crate) jacobian: Vec<Vec<f64>>,
+    /// Redundant constraint rows (ascending).
+    pub(crate) redundant: Vec<usize>,
 }
 
 /// The instantaneous forward-dynamics solve at a consistent pose and
@@ -709,22 +759,22 @@ pub(crate) fn accelerations(
         };
         top[b..b + BODY_TWIST].copy_from_slice(&twist_array(f));
     }
-    let j = problem.jacobian(params);
+    let j = problem.jacobian_sparse(params);
     let (_, s_acc) = driver_levels(problem);
     let gamma = problem.jets(params, vel);
     let bottom: Vec<f64> = s_acc.iter().zip(&gamma).map(|(s, g)| s - g.dd).collect();
-    let (a, lambda) = solve_saddle(
+    let solution = solve_saddle_full(
         problem,
-        &mass_rows(problem, &inertia),
+        &mass_triplets(problem, &inertia),
         &j,
         &top,
         &bottom,
         "forward dynamics",
     )?;
     Ok(Accelerations {
-        acc: problem.twists(&a),
-        lambda,
-        jacobian: j,
+        acc: problem.twists(&solution.x),
+        lambda: solution.mu,
+        redundant: solution.redundant,
     })
 }
 
@@ -750,14 +800,15 @@ pub fn forward_dynamics(
     let Accelerations {
         acc,
         lambda,
-        jacobian: j,
+        redundant,
+        ..
     } = accelerations(&problem, &state.params, &vel)?;
     Ok(DynamicFrame {
         time,
         velocity: by_body(state, vel),
         acceleration: by_body(state, acc),
         multipliers: problem.rows.iter().copied().zip(lambda).collect(),
-        redundant: problem.refs(&sorted_dependent(&j, problem.n_cols)),
+        redundant: problem.refs(&redundant),
         state: state.clone(),
     })
 }
@@ -798,16 +849,16 @@ pub(crate) fn project_velocity(
         .collect();
     let top = flatten(problem, &momentum);
     let (s_vel, _) = driver_levels(problem);
-    let j = problem.jacobian(params);
-    let (v, _) = solve_saddle(
+    let j = problem.jacobian_sparse(params);
+    let solution = solve_saddle_full(
         problem,
-        &mass_rows(problem, &inertia),
+        &mass_triplets(problem, &inertia),
         &j,
         &top,
         &s_vel,
         what,
     )?;
-    Ok(problem.twists(&v))
+    Ok(problem.twists(&solution.x))
 }
 
 /// A consistent output frame from an integrator state: the velocity
@@ -828,14 +879,15 @@ pub(crate) fn output_frame(
     let Accelerations {
         acc,
         lambda,
-        jacobian,
+        redundant,
+        ..
     } = accelerations(problem, &state.params, &vel)?;
     Ok(DynamicFrame {
         time: problem.time,
         velocity: by_body(state, vel),
         acceleration: by_body(state, acc),
         multipliers: problem.rows.iter().copied().zip(lambda).collect(),
-        redundant: problem.refs(&sorted_dependent(&jacobian, problem.n_cols)),
+        redundant: problem.refs(&redundant),
         state: state.clone(),
     })
 }
