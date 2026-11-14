@@ -185,8 +185,11 @@ Cards (one commit each):
    saddle-point solve (redundancy listed, minimum-norm λ; a fully driven
    mechanism = inverse dynamics), mass-weighted velocity IC, Newton static
    equilibrium, energy/momentum audits; Tier A instantaneous benchmarks.
-2. HHT-α index-3 integrator + Tier A time benchmarks (free fall, pendulum
-   period + energy, spring-mass ω = √(k/m), damping three regimes).
+2. **Done** — HHT-α index-3 integrator (`integrate::simulate`, fixed
+   nominal step landing on output times, step halving on Newton failure,
+   projected output frames) + Tier A time benchmarks (free fall, pendulum
+   period + energy, spring-mass ω = √(k/m), damping three regimes, closed
+   four-bar energy error second order in h).
 3. **λ recovery = joint reactions** (force/torque at the joint markers,
    non-unique under redundancy, flagged) + Tier B against OndselSolver's
    joint reaction series.

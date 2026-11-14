@@ -460,3 +460,350 @@ fn dynamics_failures_are_data() {
         codes::DEGENERATE_FORCE
     );
 }
+
+// ── time integration (index-3 HHT-α) ───────────────────────────────────
+
+fn grid(end: f64, step: f64) -> Vec<f64> {
+    let n = (end / step).round() as usize;
+    (0..=n).map(|k| k as f64 * step).collect()
+}
+
+fn hht(alpha: f64, step: f64) -> HhtSettings {
+    HhtSettings {
+        alpha,
+        step,
+        ..HhtSettings::default()
+    }
+}
+
+/// Complete elliptic integral of the first kind by the AGM.
+fn elliptic_k(k: f64) -> f64 {
+    let (mut a, mut b) = (1.0_f64, (1.0 - k * k).sqrt());
+    for _ in 0..30 {
+        let next = ((a + b) / 2.0, (a * b).sqrt());
+        a = next.0;
+        b = next.1;
+    }
+    std::f64::consts::PI / (2.0 * a)
+}
+
+/// Mean period of a signal from its upward zero crossings (linear
+/// interpolation between samples).
+fn period(samples: &[(f64, f64)]) -> f64 {
+    let crossings: Vec<f64> = samples
+        .windows(2)
+        .filter(|w| w[0].1 < 0.0 && w[1].1 >= 0.0)
+        .map(|w| w[0].0 + (w[1].0 - w[0].0) * (-w[0].1) / (w[1].1 - w[0].1))
+        .collect();
+    assert!(
+        crossings.len() >= 2,
+        "need two crossings, got {}",
+        crossings.len()
+    );
+    (crossings[crossings.len() - 1] - crossings[0]) / (crossings.len() - 1) as f64
+}
+
+/// Free fall with a spinning, isotropic body: the Newmark family is exact
+/// for constant acceleration, and the Lie-group rotation update is exact
+/// for constant angular velocity — at any α.
+#[test]
+fn free_fall_is_exact() {
+    for alpha in [0.0, DEFAULT_ALPHA] {
+        let mut sys = System::new("fall").with_standard_gravity();
+        let mut b = part(
+            2,
+            1.5,
+            DVec3::ZERO,
+            DVec3::splat(0.02),
+            DVec3::new(0.0, 0.0, 10.0),
+            DQuat::IDENTITY,
+        );
+        b.velocity = DVec3::new(1.0, -0.5, 3.0);
+        b.angular_velocity = DVec3::new(0.3, 2.0, -1.0);
+        sys.add_body(b.clone()).unwrap();
+        let sim = simulate(&sys, &grid(1.0, 0.1), &hht(alpha, 0.01)).unwrap();
+        for f in &sim.frames {
+            let t = f.time;
+            let (p, r) = f.state.body_pose(BodyId(2)).unwrap();
+            let expected = b.translation + b.velocity * t + 0.5 * DVec3::new(0.0, 0.0, -G) * t * t;
+            close_v(p, expected, 1e-10, "parabola");
+            let spin = DQuat::from_scaled_axis(b.angular_velocity * t);
+            assert!(r.dot(spin).abs() > 1.0 - 1e-12, "rotation at t = {t}");
+            close_v(
+                f.velocity[&BodyId(2)].angular,
+                b.angular_velocity,
+                1e-10,
+                "constant spin",
+            );
+        }
+        assert_eq!(sim.stats.rejected, 0);
+    }
+}
+
+/// Large-amplitude pendulum (θ₀ = 0.5 rad) released from rest: the period
+/// matches the exact elliptic-integral period `4·√(I_o/mgl)·K(sin θ₀/2)`
+/// and the energy holds: α = 0 (trapezoidal) is conservative, and α = −0.3
+/// dissipates only at O((ω·h)³) per step — invisible at the pendulum frequency.
+#[test]
+fn pendulum_period_and_energy() {
+    let theta0 = 0.5;
+    let sys = pendulum(theta0);
+    let tau = (i_hinge() / (M * G * L)).sqrt();
+    let exact = 4.0 * tau * elliptic_k((theta0 / 2.0).sin());
+    let scale = M * G * L;
+    for (alpha, period_tol, energy_tol) in [(0.0, 2e-6, 2e-7), (DEFAULT_ALPHA, 2e-6, 1e-6)] {
+        let sim = simulate(&sys, &grid(6.0, 0.002), &hht(alpha, 1e-3)).unwrap();
+        let samples: Vec<(f64, f64)> = sim
+            .frames
+            .iter()
+            .map(|f| (f.time, f.state.joint_angle(JointId(1)).unwrap()))
+            .collect();
+        let measured = period(&samples);
+        let e0 = energy(&sys, &sim.frames[0].state, &sim.frames[0].velocity)
+            .unwrap()
+            .total();
+        let drift = sim
+            .frames
+            .iter()
+            .map(|f| (energy(&sys, &f.state, &f.velocity).unwrap().total() - e0).abs() / scale)
+            .fold(0.0, f64::max);
+        eprintln!(
+            "alpha {alpha}: period {measured} vs {exact} (rel {:.2e}), energy drift {drift:.2e}, stats {:?}",
+            (measured - exact).abs() / exact,
+            sim.stats
+        );
+        close(measured, exact, period_tol, "period");
+        assert!(drift < energy_tol, "energy drift {drift:e}");
+    }
+}
+
+/// Small-angle pendulum: the period is `2π·√(I_o/(m·g·l))` (for a point
+/// mass `2π·√(l/g)`).
+#[test]
+fn small_angle_pendulum_period() {
+    let sys = pendulum(0.01);
+    let sim = simulate(&sys, &grid(5.0, 0.002), &hht(DEFAULT_ALPHA, 1e-3)).unwrap();
+    let samples: Vec<(f64, f64)> = sim
+        .frames
+        .iter()
+        .map(|f| (f.time, f.state.joint_angle(JointId(1)).unwrap()))
+        .collect();
+    let expected = std::f64::consts::TAU * (i_hinge() / (M * G * L)).sqrt();
+    close(period(&samples), expected, 3e-5, "small-angle period");
+}
+
+/// Spring-mass released from a stretch: `x(t) = l₀ + A·cos(ω·t)`,
+/// `ω = √(k/m)`.
+#[test]
+fn spring_mass_oscillates_at_sqrt_k_over_m() {
+    let amplitude = 0.05;
+    let sys = spring_mass(FREE + amplitude, 0.0);
+    let omega = (K / M).sqrt();
+    let sim = simulate(&sys, &grid(2.0, 0.001), &hht(DEFAULT_ALPHA, 5e-4)).unwrap();
+    let samples: Vec<(f64, f64)> = sim
+        .frames
+        .iter()
+        .map(|f| (f.time, f.state.body_pose(BodyId(2)).unwrap().0.x - FREE))
+        .collect();
+    let worst = samples
+        .iter()
+        .map(|(t, x)| (x - amplitude * (omega * t).cos()).abs())
+        .fold(0.0, f64::max);
+    let measured = std::f64::consts::TAU / period(&samples);
+    eprintln!(
+        "spring: omega {measured} vs {omega}, worst {worst:.2e}, stats {:?}",
+        sim.stats
+    );
+    close(measured, omega, 2e-5, "ω = √(k/m)");
+    assert!(worst < 1e-3 * amplitude, "trajectory error {worst:e}");
+}
+
+/// Damped oscillator in its three regimes (ζ = 0.1 under-, 1 critically,
+/// 2.5 over-damped) against the closed forms.
+#[test]
+fn damped_oscillator_three_regimes() {
+    let amplitude = 0.04;
+    let omega = (K / M).sqrt();
+    for zeta in [0.1, 1.0, 2.5] {
+        let c = 2.0 * zeta * (K * M).sqrt();
+        let sys = spring_mass(FREE + amplitude, c);
+        let exact = |t: f64| -> f64 {
+            if zeta < 1.0 {
+                let wd = omega * (1.0 - zeta * zeta).sqrt();
+                amplitude
+                    * (-zeta * omega * t).exp()
+                    * ((wd * t).cos() + zeta * omega / wd * (wd * t).sin())
+            } else if zeta == 1.0 {
+                amplitude * (-omega * t).exp() * (1.0 + omega * t)
+            } else {
+                let root = (zeta * zeta - 1.0).sqrt();
+                let (s1, s2) = (-omega * (zeta - root), -omega * (zeta + root));
+                amplitude * (s2 * (s1 * t).exp() - s1 * (s2 * t).exp()) / (s2 - s1)
+            }
+        };
+        let sim = simulate(&sys, &grid(1.5, 0.005), &hht(DEFAULT_ALPHA, 5e-4)).unwrap();
+        let worst = sim
+            .frames
+            .iter()
+            .map(|f| (f.state.body_pose(BodyId(2)).unwrap().0.x - FREE - exact(f.time)).abs())
+            .fold(0.0, f64::max);
+        eprintln!("zeta {zeta}: worst {worst:.2e}");
+        assert!(worst < 2e-4 * amplitude, "ζ = {zeta}: error {worst:e}");
+    }
+}
+
+/// A planar four-bar built from four 3D revolutes (three redundant
+/// equations) swinging under gravity from rest: index 3 keeps the loop
+/// closed, the projected output velocities satisfy the velocity
+/// constraints, and the trapezoidal rule holds the energy.
+#[test]
+fn four_bar_swings_closed_and_conservative() {
+    let (a, b, c, d) = (0.1, 0.3, 0.25, 0.3);
+    let mut sys = System::new("four-bar");
+    sys.gravity = Some(DVec3::new(0.0, -G, 0.0));
+    sys.add_body(ground()).unwrap();
+    let link = |id, len: f64, at: DVec3, angle: f64| {
+        part(
+            id,
+            0.5 + len,
+            DVec3::new(len / 2.0, 0.0, 0.0),
+            DVec3::new(1e-4, 0.004, 0.004),
+            at,
+            DQuat::from_rotation_z(angle),
+        )
+    };
+    sys.add_body(link(2, a, DVec3::ZERO, std::f64::consts::FRAC_PI_2))
+        .unwrap();
+    sys.add_body(link(3, b, DVec3::new(0.0, a, 0.0), 0.5455))
+        .unwrap();
+    sys.add_body(link(4, c, DVec3::new(d, 0.0, 0.0), 1.7239))
+        .unwrap();
+    marker(&mut sys, 1, 1, DVec3::ZERO, DQuat::IDENTITY);
+    marker(&mut sys, 2, 1, DVec3::new(d, 0.0, 0.0), DQuat::IDENTITY);
+    marker(&mut sys, 3, 2, DVec3::ZERO, DQuat::IDENTITY);
+    marker(&mut sys, 4, 2, DVec3::new(a, 0.0, 0.0), DQuat::IDENTITY);
+    marker(&mut sys, 5, 3, DVec3::ZERO, DQuat::IDENTITY);
+    marker(&mut sys, 6, 3, DVec3::new(b, 0.0, 0.0), DQuat::IDENTITY);
+    marker(&mut sys, 7, 4, DVec3::ZERO, DQuat::IDENTITY);
+    marker(&mut sys, 8, 4, DVec3::new(c, 0.0, 0.0), DQuat::IDENTITY);
+    joint(&mut sys, 1, JointKind::Revolute, 1, 3);
+    joint(&mut sys, 2, JointKind::Revolute, 4, 5);
+    joint(&mut sys, 3, JointKind::Revolute, 6, 8);
+    joint(&mut sys, 4, JointKind::Revolute, 2, 7);
+    // Energy error at two step sizes: bounded (no secular drift) and
+    // second order — halving the step quarters it.
+    let run = |step: f64| {
+        let sim = simulate(&sys, &grid(2.0, 0.01), &hht(0.0, step)).unwrap();
+        let e0 = energy(&sys, &sim.frames[0].state, &sim.frames[0].velocity).unwrap();
+        let mut drift: f64 = 0.0;
+        let mut swing: f64 = 0.0;
+        for f in &sim.frames {
+            assert_eq!(f.redundant.len(), 3, "planar loop of 3D revolutes");
+            let p = f
+                .state
+                .world_point(BodyId(3), DVec3::new(b, 0.0, 0.0))
+                .unwrap();
+            let q = f
+                .state
+                .world_point(BodyId(4), DVec3::new(c, 0.0, 0.0))
+                .unwrap();
+            assert!((p - q).length() < 1e-9, "loop closed at t = {}", f.time);
+            let arm3 = p - f.state.body_pose(BodyId(3)).unwrap().0;
+            let arm4 = q - f.state.body_pose(BodyId(4)).unwrap().0;
+            let vp = f.velocity[&BodyId(3)].point_velocity(arm3);
+            let vq = f.velocity[&BodyId(4)].point_velocity(arm4);
+            assert!(
+                (vp - vq).length() < 1e-9,
+                "velocity constraint at t = {}",
+                f.time
+            );
+            let e = energy(&sys, &f.state, &f.velocity).unwrap();
+            drift = drift.max((e.total() - e0.total()).abs());
+            swing = swing.max(e.kinetic);
+        }
+        eprintln!(
+            "four-bar h = {step}: energy error {drift:.2e} J of peak kinetic {swing:.3} J, {:?}",
+            sim.stats
+        );
+        (drift, swing)
+    };
+    let (coarse, peak) = run(1e-3);
+    let (fine, _) = run(5e-4);
+    assert!(peak > 0.1, "the linkage actually swings: {peak} J");
+    let order = (coarse / fine).log2();
+    assert!(
+        (order - 2.0).abs() < 0.2,
+        "second-order energy error: observed order {order}"
+    );
+    assert!(fine < 1e-4 * peak, "energy error {fine:e} J of {peak} J");
+}
+
+/// A driven pendulum in the integrator: the rheonomic driver equation is
+/// held exactly and the driver multiplier is the inverse-dynamics torque.
+#[test]
+fn driven_pendulum_simulates_its_driver() {
+    let mut sys = pendulum(0.0);
+    sys.add_driver(Driver {
+        joint: JointId(1),
+        slot: DriverSlot::Rotation,
+        profile: DriverProfile::Harmonic {
+            offset: 0.0,
+            amplitude: 0.6,
+            frequency_hz: 0.5,
+            phase: 0.0,
+        },
+    });
+    let sim = simulate(&sys, &grid(2.0, 0.05), &HhtSettings::default()).unwrap();
+    for f in &sim.frames {
+        let s = sys.drivers[0].sample(f.time);
+        close(
+            f.state.joint_angle(JointId(1)).unwrap(),
+            s.value,
+            1e-9,
+            "driver angle",
+        );
+        close(
+            f.velocity[&BodyId(2)].angular.z,
+            s.velocity,
+            1e-9,
+            "driver rate",
+        );
+        let torque = i_hinge() * s.acceleration + M * G * L * s.value.sin();
+        let lambda = multiplier(&f.multipliers, EquationOwner::Driver(0));
+        close(lambda[0], -torque, 1e-8, "motor torque");
+    }
+}
+
+/// Same input, same trajectory (bit for bit); bad settings and grids are
+/// data.
+#[test]
+fn integration_is_deterministic_and_validated() {
+    let sys = pendulum(1.0);
+    let times = grid(0.5, 0.05);
+    let a = simulate(&sys, &times, &HhtSettings::default()).unwrap();
+    let b = simulate(&sys, &times, &HhtSettings::default()).unwrap();
+    assert_eq!(a, b);
+    for bad in [
+        hht(0.1, 1e-3),
+        hht(-0.5, 1e-3),
+        hht(0.0, 0.0),
+        hht(0.0, f64::NAN),
+    ] {
+        assert_eq!(
+            simulate(&sys, &times, &bad).unwrap_err().code,
+            codes::BAD_INTEGRATOR_SETTINGS
+        );
+    }
+    assert_eq!(
+        simulate(&sys, &[0.0, 1.0, 0.5], &HhtSettings::default())
+            .unwrap_err()
+            .code,
+        codes::BAD_TIME_GRID
+    );
+    assert_eq!(
+        simulate(&sys, &[], &HhtSettings::default())
+            .unwrap_err()
+            .code,
+        codes::BAD_TIME_GRID
+    );
+}

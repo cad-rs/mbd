@@ -256,7 +256,7 @@ pub(crate) fn retract(problem: &Problem, params: &[f64], delta: &[f64]) -> Vec<f
 }
 
 /// Per-slot inertia (`None` for grounded slots).
-fn inertias(problem: &Problem, params: &[f64]) -> Vec<Option<BodyInertia>> {
+pub(crate) fn inertias(problem: &Problem, params: &[f64]) -> Vec<Option<BodyInertia>> {
     problem
         .sys
         .bodies
@@ -427,7 +427,7 @@ fn mass_rows(problem: &Problem, inertia: &[Option<BodyInertia>]) -> Vec<Vec<f64>
     rows
 }
 
-fn sorted_dependent(j: &[Vec<f64>], n: usize) -> Vec<usize> {
+pub(crate) fn sorted_dependent(j: &[Vec<f64>], n: usize) -> Vec<usize> {
     let mut d = RowFactor::new(j, n).dependent().to_vec();
     d.sort_unstable();
     d
@@ -481,7 +481,7 @@ pub(crate) fn accelerations(
     })
 }
 
-fn by_body(state: &KinematicState, twists: Vec<Twist>) -> BTreeMap<BodyId, Twist> {
+pub(crate) fn by_body(state: &KinematicState, twists: Vec<Twist>) -> BTreeMap<BodyId, Twist> {
     state.order.iter().copied().zip(twists).collect()
 }
 
@@ -530,25 +530,67 @@ pub fn velocity_ic(
     sys.validate()?;
     check_state(sys, state)?;
     let problem = Problem::new(sys, time, &state.angles);
-    let inertia = inertias(&problem, &state.params);
     let v0 = slot_twists(&problem, authored);
+    let v = project_velocity(&problem, &state.params, &v0, "velocity initial condition")?;
+    Ok(by_body(state, v))
+}
+
+/// The kinetic-energy-norm projection of per-slot velocities onto
+/// `J·v = ṡ` at pose `params` (see [`velocity_ic`]).
+pub(crate) fn project_velocity(
+    problem: &Problem,
+    params: &[f64],
+    v0: &[Twist],
+    what: &str,
+) -> Result<Vec<Twist>, MbdError> {
+    let inertia = inertias(problem, params);
     let momentum: Vec<Twist> = v0
         .iter()
         .zip(&inertia)
         .map(|(v, i)| i.map_or_else(Twist::default, |i| i.apply(*v)))
         .collect();
-    let top = flatten(&problem, &momentum);
-    let (s_vel, _) = driver_levels(&problem);
-    let j = problem.jacobian(&state.params);
+    let top = flatten(problem, &momentum);
+    let (s_vel, _) = driver_levels(problem);
+    let j = problem.jacobian(params);
     let (v, _) = solve_saddle(
-        &problem,
-        &mass_rows(&problem, &inertia),
+        problem,
+        &mass_rows(problem, &inertia),
         &j,
         &top,
         &s_vel,
-        "velocity initial condition",
+        what,
     )?;
-    Ok(by_body(state, problem.twists(&v)))
+    Ok(problem.twists(&v))
+}
+
+/// A consistent output frame from an integrator state: the velocity
+/// projected onto `J·v = ṡ`, then the acceleration and multipliers solved
+/// on the acceleration level there (the index-3 state itself is not
+/// changed).
+pub(crate) fn output_frame(
+    problem: &Problem,
+    state: &KinematicState,
+    raw_velocity: &[Twist],
+) -> Result<DynamicFrame, MbdError> {
+    let vel = project_velocity(
+        problem,
+        &state.params,
+        raw_velocity,
+        "output velocity projection",
+    )?;
+    let Accelerations {
+        acc,
+        lambda,
+        jacobian,
+    } = accelerations(problem, &state.params, &vel)?;
+    Ok(DynamicFrame {
+        time: problem.time,
+        velocity: by_body(state, vel),
+        acceleration: by_body(state, acc),
+        multipliers: problem.rows.iter().copied().zip(lambda).collect(),
+        redundant: problem.refs(&sorted_dependent(&jacobian, problem.n_cols)),
+        state: state.clone(),
+    })
 }
 
 /// The dynamic initial condition at `time`: the position IC from the

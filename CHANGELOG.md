@@ -12,6 +12,30 @@
 
 ## Unreleased (M1 + M1.5 complete, M2 in progress)
 
+### M2 card 2 — index-3 HHT-α integrator
+
+- `integrate` module: `simulate(sys, times, &HhtSettings)` — dynamic IC at
+  the first output time, then index-3 HHT-α steps (`β = (1−α)²/4`,
+  `γ = ½ − α`, default α = −0.3 = `DEFAULT_ALPHA`) landing on every output
+  time. Lie-group rotation increment `R ← exp(Δθ)·R`; constraint rows
+  scaled by `1/(β·h²)`; iteration matrix `[∂r/∂a (1+α)Jᵀ; J 0]` by forward
+  differences, reused across steps (modified Newton) and rebuilt when
+  convergence slows; a failed step is halved (down to `step/1024`).
+  Output frames are projected (velocity onto `J·v = ṡ`, then acceleration
+  and λ on the acceleration level); the integrator state is untouched.
+  `IntegrationStats` counts steps, rejections, Newton iterations and
+  matrix builds. New codes `bad_integrator_settings`, `integration_failed`.
+- Tier A time benchmarks: free fall with spin exact at any α (1e-10);
+  θ₀ = 0.5 rad pendulum period against the elliptic-integral period
+  (1.3e-6 at α = 0, 1.9e-6 at α = −0.3) with energy error 2e-8 / 1e-7 of
+  m·g·l over 6 s; small-angle period 2π·√(I_o/mgl); spring-mass
+  ω = √(k/m) (6e-6) and trajectory; damped oscillator ζ = 0.1 / 1 / 2.5
+  against the closed forms (≤ 1e-6 of A); a four-bar of 3D revolutes
+  (three redundant equations) stays closed to 1e-9 on positions and
+  projected velocities, with energy error bounded and second order in h
+  (3.2e-4 → 8.0e-5 J of 1.95 J); driven pendulum holds its driver and its
+  λ is the inverse-dynamics torque; bitwise determinism.
+
 ### M2 card 1 — equations of motion, dynamic IC, static equilibrium
 
 - Integrator route decided at the M2 review: index-3 HHT-α (Adams HHT;
@@ -139,6 +163,6 @@
 
 ### Next
 
-- M2 card 2: the HHT-α index-3 integrator + Tier A time-integration
-  benchmarks (free fall, pendulum period + energy, spring-mass ω, damping
-  regimes).
+- M2 card 3: λ recovery as joint reactions (force/torque at the joint
+  markers, non-unique under redundancy) + Tier B against OndselSolver's
+  joint reaction series.

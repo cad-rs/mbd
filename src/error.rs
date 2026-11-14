@@ -74,4 +74,9 @@ pub mod codes {
     /// A force element is geometrically degenerate (a spring with coincident
     /// markers but a nonzero free length).
     pub const DEGENERATE_FORCE: &str = "degenerate_force";
+    /// Integrator settings out of range (α outside [−1/3, 0], a
+    /// non-positive step or tolerance).
+    pub const BAD_INTEGRATOR_SETTINGS: &str = "bad_integrator_settings";
+    /// The integrator could not complete a step even at its minimum step.
+    pub const INTEGRATION_FAILED: &str = "integration_failed";
 }

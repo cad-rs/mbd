@@ -31,6 +31,7 @@ pub mod driver;
 pub mod dynamics;
 pub mod error;
 pub mod force;
+pub mod integrate;
 mod jet;
 pub mod joint;
 pub mod kinematics;
@@ -49,6 +50,7 @@ pub use dynamics::{
 };
 pub use error::{codes, MbdError};
 pub use force::{ForceElement, ForceId};
+pub use integrate::{simulate, HhtSettings, IntegrationStats, Simulation, DEFAULT_ALPHA};
 pub use joint::{Joint, JointId, JointKind};
 pub use kinematics::{
     diagnose, equation_count, kinematic_sweep, position_ic, position_ic_from, solve_frame,
