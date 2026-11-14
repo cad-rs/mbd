@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::joint::JointId;
 
 /// Which slot of a joint a driver moves.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DriverSlot {
     /// Joint rotation about the common Z axis (rad): revolute, cylindrical,

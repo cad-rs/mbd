@@ -54,12 +54,19 @@ fn part_name(body: &Body) -> String {
 /// Refused as [`codes::ASMT_UNSUPPORTED`]: a body inertia that is not
 /// diagonal in the body axes (principal axes are not derived here), a
 /// driver profile without a closed-form expression (keyframes, step,
-/// spline), force elements and gravity.
+/// spline), force elements and gravity, and couplers (OndselSolver's gear /
+/// rack-pinion / screw joints relate two markers directly, not joint
+/// coordinates, so there is no faithful one-to-one mapping).
 pub fn write_asmt(sys: &System, sim: &AsmtSimulation) -> Result<String, MbdError> {
     sys.validate()?;
     if !sys.forces.is_empty() || sys.gravity.is_some_and(|g| g != DVec3::ZERO) {
         return Err(unsupported(
             "force elements and gravity are not exported (kinematic subset)",
+        ));
+    }
+    if !sys.couplers.is_empty() {
+        return Err(unsupported(
+            "couplers are not exported (OndselSolver couples markers, not joint coordinates)",
         ));
     }
     // OndselSolver realizes a motion by turning its I marker into a
@@ -258,6 +265,11 @@ fn joint_keyword(kind: JointKind) -> &'static str {
         JointKind::Planar => "PlanarJoint",
         JointKind::Universal => "UniversalJoint",
         JointKind::Fixed => "FixedJoint",
+        JointKind::InLine => "PointInLineJoint",
+        JointKind::InPlane => "PointInPlaneJoint",
+        JointKind::Orientation => "NoRotationJoint",
+        JointKind::ParallelAxes => "ParallelAxesJoint",
+        JointKind::Perpendicular => "PerpendicularJoint",
     }
 }
 

@@ -39,6 +39,7 @@ use crate::jet::{BodyMotion, FrameJet, Jet};
 use crate::joint::{joint_coordinate, joint_rows, DriverSlot, JointId};
 use crate::linalg::RowFactor;
 use crate::system::System;
+use crate::coupler::{Coupler, CouplerId};
 
 /// Parameter slots per body in the flat state vector.
 pub const BODY_PARAMS: usize = 7;
@@ -50,11 +51,16 @@ pub const BODY_TWIST: usize = 6;
 ///
 /// Slot `i` occupies `params[7i .. 7i+7]` = `[tx, ty, tz, qx, qy, qz, qw]`
 /// (the quaternion is stored `xyzw`, the glam [`DQuat::from_xyzw`] order).
+///
+/// The state also tracks every rotation joint coordinate (revolute,
+/// cylindrical, planar) **unwrapped across turns** — what couplers relate
+/// and what [`KinematicState::joint_angle`] reports.
 #[derive(Debug, Clone, PartialEq)]
 pub struct KinematicState {
     params: Vec<f64>,
     order: Vec<BodyId>,
     slot_of: BTreeMap<BodyId, usize>,
+    angles: BTreeMap<JointId, f64>,
 }
 
 impl KinematicState {
@@ -69,7 +75,21 @@ impl KinematicState {
             slot_of.insert(*id, slot);
             params.extend_from_slice(&pose_params(body.translation, body.rotation));
         }
-        Self { params, order, slot_of }
+        let rest = vec![Twist::default(); order.len()];
+        let angles = rotation_joints(sys)
+            .map(|j| {
+                let raw = coordinate_jet(sys, &slot_of, &params, &rest, j.id, DriverSlot::Rotation);
+                (j.id, raw.v)
+            })
+            .collect();
+        Self { params, order, slot_of, angles }
+    }
+
+    /// A rotation joint's coordinate (rad), unwrapped across turns since the
+    /// authored configuration (the authored value is the raw angle in
+    /// `(−π, π]`). `None` for joints without a rotation coordinate.
+    pub fn joint_angle(&self, joint: JointId) -> Option<f64> {
+        self.angles.get(&joint).copied()
     }
 
     /// The flat parameter vector.
@@ -127,6 +147,43 @@ fn read_pose(params: &[f64], slot: usize) -> (DVec3, DQuat) {
     )
 }
 
+/// The unsuppressed joints that carry a rotation coordinate.
+fn rotation_joints(sys: &System) -> impl Iterator<Item = &crate::joint::Joint> {
+    sys.joints
+        .values()
+        .filter(|j| !j.suppressed && j.kind.drives(DriverSlot::Rotation))
+}
+
+/// A marker's world frame as jets along `motion`.
+fn marker_frame(
+    sys: &System,
+    slot_of: &BTreeMap<BodyId, usize>,
+    params: &[f64],
+    motion: &[Twist],
+    marker: MarkerId,
+) -> FrameJet {
+    let m = &sys.markers[&marker];
+    let slot = slot_of[&m.body];
+    let (t, r) = read_pose(params, slot);
+    let body = BodyMotion { t, r, v: motion[slot].linear, w: motion[slot].angular };
+    body.frame(m.translation, m.rotation)
+}
+
+/// A joint coordinate as a jet (raw: rotation in `(−π, π]`).
+fn coordinate_jet(
+    sys: &System,
+    slot_of: &BTreeMap<BodyId, usize>,
+    params: &[f64],
+    motion: &[Twist],
+    joint: JointId,
+    slot: DriverSlot,
+) -> Jet {
+    let j = &sys.joints[&joint];
+    let f1 = marker_frame(sys, slot_of, params, motion, j.marker1);
+    let f2 = marker_frame(sys, slot_of, params, motion, j.marker2);
+    joint_coordinate(j.kind, slot, &f1, &f2).unwrap_or_default()
+}
+
 /// A rigid-body velocity (or acceleration): the linear rate of the body
 /// frame origin and the angular rate, both in the world frame.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -147,6 +204,7 @@ impl Twist {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum EquationOwner {
     Joint(JointId),
+    Coupler(CouplerId),
     /// A driver, by its index in [`System::drivers`].
     Driver(usize),
 }
@@ -164,13 +222,14 @@ pub struct EquationRef {
 pub struct KinematicDiagnosis {
     /// Tangent coordinates: 6 per free body.
     pub coordinates: usize,
-    /// Rank of the full constraint Jacobian (joints + drivers).
+    /// Rank of the full constraint Jacobian (joints + couplers + drivers).
     pub rank: usize,
     /// Degrees of freedom left with the drivers applied (`coordinates −
     /// rank`): 0 is what a kinematic analysis needs.
     pub dof: usize,
     /// The mechanism's mobility, drivers removed (`coordinates −
-    /// rank(joint rows)`): how many drivers it takes to prescribe it.
+    /// rank(joint + coupler rows)`): how many drivers it takes to
+    /// prescribe it.
     pub mobility: usize,
     /// Dependent equations consistent with the rest: removable without
     /// changing the motion (their reactions are not unique).
@@ -194,20 +253,33 @@ pub struct KinematicFrame {
 }
 
 /// The number of equations the position IC solves for a system: one
-/// unit-norm equation per body, the joint equations, and one equation per
-/// (unsuppressed) driver.
+/// unit-norm equation per body, the joint equations, one per coupler and
+/// one per driver (suppressed joints drop out with their couplers and
+/// drivers).
 pub fn equation_count(sys: &System) -> usize {
     sys.bodies.len() + constraint_layout(sys).len()
 }
 
-/// The constraint equations (joints in id order, then drivers in authoring
-/// order), skipping suppressed joints and their drivers.
+/// Whether every joint a coupler references is active.
+fn coupler_active(sys: &System, coupler: &Coupler) -> bool {
+    coupler
+        .terms
+        .iter()
+        .all(|t| sys.joints.get(&t.joint).is_some_and(|j| !j.suppressed))
+}
+
+/// The constraint equations: joints in id order, couplers in id order (the
+/// mechanism), then drivers in authoring order (the prescription);
+/// suppressed joints drop out with their couplers and drivers.
 fn constraint_layout(sys: &System) -> Vec<EquationRef> {
     let mut rows = Vec::new();
     for joint in sys.joints.values().filter(|j| !j.suppressed) {
         for row in 0..joint.kind.constraint_count() {
             rows.push(EquationRef { owner: EquationOwner::Joint(joint.id), row });
         }
+    }
+    for coupler in sys.couplers.values().filter(|c| coupler_active(sys, c)) {
+        rows.push(EquationRef { owner: EquationOwner::Coupler(coupler.id), row: 0 });
     }
     for (index, driver) in sys.drivers.iter().enumerate() {
         if sys.joints.get(&driver.joint).is_some_and(|j| !j.suppressed) {
@@ -231,12 +303,23 @@ struct Problem<'a> {
     col_of: Vec<Option<usize>>,
     n_cols: usize,
     rows: Vec<EquationRef>,
+    /// Joint rows (contiguous at the front).
     n_joint_rows: usize,
+    /// Joint + coupler rows (the mechanism, contiguous at the front).
+    n_mechanism_rows: usize,
     time: f64,
+    /// Unwrapping references for rotation coordinates (the seed's tracked
+    /// angles).
+    refs: BTreeMap<JointId, f64>,
+    /// Rotation coordinates prescribed by a driver: the driver index (its
+    /// value is the unwrapping reference).
+    rotation_driver: BTreeMap<JointId, usize>,
+    /// Authored values of every coordinate a coupler uses.
+    authored: BTreeMap<(JointId, DriverSlot), f64>,
 }
 
 impl<'a> Problem<'a> {
-    fn new(sys: &'a System, time: f64) -> Self {
+    fn new(sys: &'a System, time: f64, refs: &BTreeMap<JointId, f64>) -> Self {
         let mut slot_of = BTreeMap::new();
         let mut col_of = Vec::with_capacity(sys.bodies.len());
         let mut n_cols = 0;
@@ -250,11 +333,40 @@ impl<'a> Problem<'a> {
             }
         }
         let rows = constraint_layout(sys);
-        let n_joint_rows = rows
+        let count = |f: fn(&EquationOwner) -> bool| rows.iter().filter(|r| f(&r.owner)).count();
+        let n_joint_rows = count(|o| matches!(o, EquationOwner::Joint(_)));
+        let n_mechanism_rows = n_joint_rows + count(|o| matches!(o, EquationOwner::Coupler(_)));
+        let rotation_driver = sys
+            .drivers
             .iter()
-            .filter(|r| matches!(r.owner, EquationOwner::Joint(_)))
-            .count();
-        Self { sys, slot_of, col_of, n_cols, rows, n_joint_rows, time }
+            .enumerate()
+            .filter(|(_, d)| d.slot == DriverSlot::Rotation)
+            .map(|(i, d)| (d.joint, i))
+            .collect();
+        let mut problem = Self {
+            sys,
+            slot_of,
+            col_of,
+            n_cols,
+            rows,
+            n_joint_rows,
+            n_mechanism_rows,
+            time,
+            refs: refs.clone(),
+            rotation_driver,
+            authored: BTreeMap::new(),
+        };
+        let authored_state = KinematicState::from_system(sys);
+        let rest = vec![Twist::default(); problem.n_bodies()];
+        let mut authored = BTreeMap::new();
+        for coupler in sys.couplers.values().filter(|c| coupler_active(sys, c)) {
+            for term in &coupler.terms {
+                let raw = problem.raw(&authored_state.params, &rest, term.joint, term.slot);
+                authored.insert((term.joint, term.slot), raw.v);
+            }
+        }
+        problem.authored = authored;
+        problem
     }
 
     fn n_bodies(&self) -> usize {
@@ -262,16 +374,49 @@ impl<'a> Problem<'a> {
     }
 
     fn frame(&self, params: &[f64], motion: &[Twist], marker: MarkerId) -> FrameJet {
-        let m = &self.sys.markers[&marker];
-        let slot = self.slot_of[&m.body];
-        let (t, r) = read_pose(params, slot);
-        let body = BodyMotion { t, r, v: motion[slot].linear, w: motion[slot].angular };
-        body.frame(m.translation, m.rotation)
+        marker_frame(self.sys, &self.slot_of, params, motion, marker)
+    }
+
+    fn raw(&self, params: &[f64], motion: &[Twist], joint: JointId, slot: DriverSlot) -> Jet {
+        coordinate_jet(self.sys, &self.slot_of, params, motion, joint, slot)
+    }
+
+    /// The reference a rotation coordinate unwraps against: its driver's
+    /// prescribed value when driven, else the seed's tracked angle.
+    fn angle_reference(&self, joint: JointId) -> f64 {
+        if let Some(&i) = self.rotation_driver.get(&joint) {
+            return self.sys.drivers[i].value_at(self.time);
+        }
+        self.refs
+            .get(&joint)
+            .or_else(|| self.authored.get(&(joint, DriverSlot::Rotation)))
+            .copied()
+            .unwrap_or(0.0)
+    }
+
+    /// A joint coordinate as a jet, rotation unwrapped against its
+    /// reference.
+    fn coordinate(&self, params: &[f64], motion: &[Twist], joint: JointId, slot: DriverSlot) -> Jet {
+        let mut jet = self.raw(params, motion, joint, slot);
+        if slot == DriverSlot::Rotation {
+            let reference = self.angle_reference(joint);
+            jet.v = reference + wrap_angle(jet.v - reference);
+        }
+        jet
+    }
+
+    /// The tracked rotation angles at `params` (after a converged solve).
+    fn track_angles(&self, params: &[f64]) -> BTreeMap<JointId, f64> {
+        let rest = vec![Twist::default(); self.n_bodies()];
+        rotation_joints(self.sys)
+            .map(|j| (j.id, self.coordinate(params, &rest, j.id, DriverSlot::Rotation).v))
+            .collect()
     }
 
     /// Every constraint row as a jet along `motion` (zero accelerations):
-    /// joint rows, then the drivers' measured joint coordinates (time terms
-    /// excluded — the callers add them).
+    /// joint rows, coupler rows (`Σ cᵢ·(qᵢ − qᵢ_authored)`), then the drivers'
+    /// measured joint coordinates (time terms excluded — the callers add
+    /// them).
     fn jets(&self, params: &[f64], motion: &[Twist]) -> Vec<Jet> {
         let mut out = Vec::with_capacity(self.rows.len());
         let mut buf = [Jet::default(); 6];
@@ -282,12 +427,24 @@ impl<'a> Problem<'a> {
             out.extend_from_slice(&buf[..n]);
         }
         for row in &self.rows[self.n_joint_rows..] {
-            let EquationOwner::Driver(index) = row.owner else { continue };
-            let driver = &self.sys.drivers[index];
-            let joint = &self.sys.joints[&driver.joint];
-            let f1 = self.frame(params, motion, joint.marker1);
-            let f2 = self.frame(params, motion, joint.marker2);
-            out.push(joint_coordinate(joint.kind, driver.slot, &f1, &f2).unwrap_or_default());
+            out.push(match row.owner {
+                EquationOwner::Joint(_) => unreachable!("joint rows come first"),
+                EquationOwner::Coupler(id) => {
+                    let mut sum = Jet::default();
+                    for term in &self.sys.couplers[&id].terms {
+                        let q = self.coordinate(params, motion, term.joint, term.slot);
+                        let q0 = self.authored[&(term.joint, term.slot)];
+                        sum.v += term.coefficient * (q.v - q0);
+                        sum.d += term.coefficient * q.d;
+                        sum.dd += term.coefficient * q.dd;
+                    }
+                    sum
+                }
+                EquationOwner::Driver(index) => {
+                    let driver = &self.sys.drivers[index];
+                    self.raw(params, motion, driver.joint, driver.slot)
+                }
+            });
         }
         debug_assert_eq!(out.len(), self.rows.len());
         out
@@ -300,7 +457,7 @@ impl<'a> Problem<'a> {
         let jets = self.jets(params, &rest);
         for (k, (row, jet)) in self.rows.iter().zip(&jets).enumerate() {
             out[k] = match row.owner {
-                EquationOwner::Joint(_) => jet.v,
+                EquationOwner::Joint(_) | EquationOwner::Coupler(_) => jet.v,
                 EquationOwner::Driver(index) => {
                     let driver = &self.sys.drivers[index];
                     let r = jet.v - driver.value_at(self.time);
@@ -391,7 +548,7 @@ impl<'a> Problem<'a> {
             .filter(|k| !conflicts.contains(k))
             .collect();
         redundant.sort_unstable();
-        let joint_rank = RowFactor::new(&j[..self.n_joint_rows], self.n_cols).rank();
+        let joint_rank = RowFactor::new(&j[..self.n_mechanism_rows], self.n_cols).rank();
         KinematicDiagnosis {
             coordinates: self.n_cols,
             rank: factor.rank(),
@@ -429,6 +586,10 @@ fn describe(sys: &System, refs: &[EquationRef]) -> String {
             EquationOwner::Joint(id) => {
                 let name = sys.joints.get(&id).map(|j| j.name.as_str()).unwrap_or("?");
                 format!("joint {} ({name}) row {}", id.0, r.row)
+            }
+            EquationOwner::Coupler(id) => {
+                let name = sys.couplers.get(&id).map(|c| c.name.as_str()).unwrap_or("?");
+                format!("coupler {} ({name})", id.0)
             }
             EquationOwner::Driver(i) => {
                 let joint = sys.drivers.get(i).map(|d| d.joint.0).unwrap_or(0);
@@ -483,7 +644,7 @@ pub fn position_ic_from(sys: &System, time: f64, seed: &KinematicState) -> Resul
 }
 
 fn solve_position(sys: &System, time: f64, mut state: KinematicState) -> Result<KinematicState, MbdError> {
-    let problem = Problem::new(sys, time);
+    let problem = Problem::new(sys, time, &state.angles);
     let fixed = problem.fixed_mask();
     let n_eq = problem.n_bodies() + problem.rows.len();
     let GcsSolveResult { converged, residual, iterations } =
@@ -504,6 +665,7 @@ fn solve_position(sys: &System, time: f64, mut state: KinematicState) -> Result<
         ));
     }
     state.normalize_quaternions();
+    state.angles = problem.track_angles(&state.params);
     Ok(state)
 }
 
@@ -512,7 +674,7 @@ fn solve_position(sys: &System, time: f64, mut state: KinematicState) -> Result<
 pub fn diagnose(sys: &System, state: &KinematicState, time: f64) -> Result<KinematicDiagnosis, MbdError> {
     sys.validate()?;
     check_state(sys, state)?;
-    Ok(Problem::new(sys, time).diagnose(&state.params))
+    Ok(Problem::new(sys, time, &state.angles).diagnose(&state.params))
 }
 
 /// Solve one instant on all three levels: position (from `seed`, or the
@@ -529,7 +691,7 @@ pub fn solve_frame(sys: &System, time: f64, seed: Option<&KinematicState>) -> Re
         Some(seed) => position_ic_from(sys, time, seed)?,
         None => position_ic(sys, time)?,
     };
-    let problem = Problem::new(sys, time);
+    let problem = Problem::new(sys, time, &state.angles);
     let j = problem.jacobian(&state.params);
     let factor = RowFactor::new(&j, problem.n_cols);
     if factor.rank() < problem.n_cols {
@@ -545,7 +707,7 @@ pub fn solve_frame(sys: &System, time: f64, seed: Option<&KinematicState>) -> Re
         .iter()
         .map(|r| match r.owner {
             EquationOwner::Driver(i) => Some(sys.drivers[i].sample(time)),
-            EquationOwner::Joint(_) => None,
+            EquationOwner::Joint(_) | EquationOwner::Coupler(_) => None,
         })
         .collect();
     let b_vel: Vec<f64> = samples.iter().map(|s| s.map_or(0.0, |s| s.velocity)).collect();
@@ -686,7 +848,7 @@ mod tests {
     fn residual_layout_is_consistent() {
         let sys = hinge(0.0);
         assert_eq!(equation_count(&sys), 2 + 5 + 1);
-        let problem = Problem::new(&sys, 0.0);
+        let problem = Problem::new(&sys, 0.0, &BTreeMap::new());
         let mut out = vec![0.0; equation_count(&sys)];
         let state = KinematicState::from_system(&sys);
         problem.eval(state.params(), &mut out);
@@ -839,6 +1001,11 @@ mod tests {
             JointKind::Planar,
             JointKind::Universal,
             JointKind::Fixed,
+            JointKind::InLine,
+            JointKind::InPlane,
+            JointKind::Orientation,
+            JointKind::ParallelAxes,
+            JointKind::Perpendicular,
         ] {
             let jets = rows(&body1, &body2, kind);
             let ahead = rows(&at(&body1, h), &at(&body2, h), kind);

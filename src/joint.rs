@@ -32,6 +32,23 @@ pub enum JointKind {
     Universal,
     /// No relative motion (6 removed).
     Fixed,
+    // ── Joint primitives (Adams JPRIM) ─────────────────────────────────
+    // Single geometric relations, so CAD mates map one to one; the lower
+    // pairs above are combinations of them (revolute = spherical +
+    // parallel axes, prismatic = in-line + orientation, cylindrical =
+    // in-line + parallel axes, planar = in-plane + parallel axes).
+    /// Marker 2's origin stays on marker 1's Z axis (2 removed) — the
+    /// "point on line" mate.
+    InLine,
+    /// Marker 2's origin stays in marker 1's XY plane (1 removed) — the
+    /// "point on plane" / coincident-face mate.
+    InPlane,
+    /// The relative orientation is locked, translation free (3 removed).
+    Orientation,
+    /// The Z axes stay parallel (2 removed) — the parallel mate.
+    ParallelAxes,
+    /// The Z axes stay perpendicular (1 removed) — the perpendicular mate.
+    Perpendicular,
 }
 
 impl JointKind {
@@ -46,7 +63,9 @@ impl JointKind {
         match self {
             JointKind::Revolute | JointKind::Prismatic => 5,
             JointKind::Cylindrical | JointKind::Universal => 4,
-            JointKind::Spherical | JointKind::Planar => 3,
+            JointKind::Spherical | JointKind::Planar | JointKind::Orientation => 3,
+            JointKind::InLine | JointKind::ParallelAxes => 2,
+            JointKind::InPlane | JointKind::Perpendicular => 1,
             JointKind::Fixed => 6,
         }
     }
@@ -96,6 +115,11 @@ pub struct Joint {
 /// - `Planar`: `z2 ⟂ x1, y1` (2) + `dp ⟂ z1` (1).
 /// - `Universal`: origin coincidence (3) + `z1 ⟂ z2` (1).
 /// - `Fixed`: origin coincidence (3) + relative orientation locked (3).
+/// - Primitives: `InLine` `dp ⟂ x1, y1`; `InPlane` `dp ⟂ z1`;
+///   `Orientation` the prismatic's three orientation rows; `ParallelAxes`
+///   `z2 ⟂ x1, y1`; `Perpendicular` `z1 ⟂ z2` — the same rows the lower
+///   pairs use, so a pair and its primitive decomposition are identical
+///   equation sets.
 ///
 /// Known limitation (shared with the dot-product formulations of the
 /// commercial solvers): the axis and orientation rows are also satisfied by
@@ -135,6 +159,11 @@ pub(crate) fn joint_rows(kind: JointKind, f1: &FrameJet, f2: &FrameJet, out: &mu
             f1.z.dot(f2.x),
             f1.z.dot(f2.y),
         ],
+        JointKind::InLine => &[dp.dot(f1.x), dp.dot(f1.y)],
+        JointKind::InPlane => &[dp.dot(f1.z)],
+        JointKind::Orientation => &[f1.y.dot(f2.x), f1.z.dot(f2.x), f1.z.dot(f2.y)],
+        JointKind::ParallelAxes => &[f1.x.dot(f2.z), f1.y.dot(f2.z)],
+        JointKind::Perpendicular => &[f1.z.dot(f2.z)],
     };
     out[..rows.len()].copy_from_slice(rows);
     rows.len()

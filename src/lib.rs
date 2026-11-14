@@ -26,6 +26,7 @@
 
 pub mod asmt;
 pub mod body;
+pub mod coupler;
 pub mod driver;
 pub mod error;
 pub mod force;
@@ -37,6 +38,7 @@ pub mod system;
 
 pub use asmt::{write_asmt, AsmtSimulation};
 pub use body::{Body, BodyId, Marker, MarkerId};
+pub use coupler::{Coupler, CouplerId, CouplerTerm};
 pub use driver::{Driver, DriverProfile, DriverSample, DriverSlot};
 pub use error::{codes, MbdError};
 pub use force::{ForceElement, ForceId};

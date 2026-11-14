@@ -8,6 +8,7 @@ use glam::DVec3;
 use serde::{Deserialize, Serialize};
 
 use crate::body::{Body, BodyId, Marker, MarkerId};
+use crate::coupler::{Coupler, CouplerId};
 use crate::error::{codes, MbdError};
 use crate::force::{ForceElement, ForceId};
 use crate::joint::{Driver, DriverSlot, Joint, JointId};
@@ -29,6 +30,10 @@ pub struct System {
     pub forces: BTreeMap<ForceId, ForceElement>,
     /// Gravity in the inertial frame (m/s²); `None` = no gravity.
     pub gravity: Option<DVec3>,
+    /// Joint-coordinate couplers (gears, rack-and-pinion, screws). Absent
+    /// in documents written before couplers existed.
+    #[serde(default)]
+    pub couplers: BTreeMap<CouplerId, Coupler>,
 }
 
 impl System {
@@ -41,6 +46,7 @@ impl System {
             drivers: Vec::new(),
             forces: BTreeMap::new(),
             gravity: None,
+            couplers: BTreeMap::new(),
         }
     }
 
@@ -87,6 +93,15 @@ impl System {
             return Err(duplicate("force", id.0));
         }
         self.forces.insert(id, force);
+        Ok(id)
+    }
+
+    pub fn add_coupler(&mut self, coupler: Coupler) -> Result<CouplerId, MbdError> {
+        let id = coupler.id;
+        if self.couplers.contains_key(&id) {
+            return Err(duplicate("coupler", id.0));
+        }
+        self.couplers.insert(id, coupler);
         Ok(id)
     }
 
@@ -172,6 +187,39 @@ impl System {
                     format!("driver on joint {} ({}): {reason}", joint.id.0, joint.name),
                     "fix the profile data (finite numbers, sorted times, enough points)",
                 ));
+            }
+        }
+        for coupler in self.couplers.values() {
+            let bad = |detail: String| {
+                Err(MbdError::new(
+                    codes::BAD_COUPLER,
+                    format!("coupler {} ({}): {detail}", coupler.id.0, coupler.name),
+                    "a coupler needs finite non-zero coefficients on measurable coordinates of existing joints",
+                ))
+            };
+            if coupler.terms.is_empty() {
+                return bad("no terms".into());
+            }
+            for term in &coupler.terms {
+                let Some(joint) = self.joints.get(&term.joint) else {
+                    return Err(MbdError::new(
+                        codes::DANGLING_JOINT,
+                        format!(
+                            "coupler {} ({}) references missing joint {}",
+                            coupler.id.0, coupler.name, term.joint.0
+                        ),
+                        "add the joint before coupling it",
+                    ));
+                };
+                if !joint.kind.drives(term.slot) {
+                    return bad(format!(
+                        "{:?} is not a coordinate of {:?} joint {}",
+                        term.slot, joint.kind, joint.id.0
+                    ));
+                }
+                if !term.coefficient.is_finite() || term.coefficient == 0.0 {
+                    return bad(format!("coefficient {} on joint {}", term.coefficient, joint.id.0));
+                }
             }
         }
         Ok(())
