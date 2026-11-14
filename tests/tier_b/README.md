@@ -26,9 +26,12 @@ systems (`cases.rs`). The references are the committed `<case>.json` files;
 
    ```sh
    cargo run --example tier_b -- export <dir>
-   <build>/ondsel_run <dir>/offset_crank_slider.asmt <dir>/offset_crank_slider.out.asmt \
-                      <dir>/spatial_rsur.asmt        <dir>/spatial_rsur.out.asmt \
-                      <dir>/nested_chain.asmt        <dir>/nested_chain.out.asmt
+   # one (in, out) pair per case in cases.rs::all()
+   <build>/ondsel_run <dir>/offset_crank_slider.asmt    <dir>/offset_crank_slider.out.asmt \
+                      <dir>/spatial_rsur.asmt           <dir>/spatial_rsur.out.asmt \
+                      <dir>/nested_chain.asmt           <dir>/nested_chain.out.asmt \
+                      <dir>/primitive_crank_slider.asmt <dir>/primitive_crank_slider.out.asmt \
+                      <dir>/primitive_rsur.asmt         <dir>/primitive_rsur.out.asmt
    cargo run --example tier_b -- reference <dir> "OndselSolver <commit>"
    ```
 

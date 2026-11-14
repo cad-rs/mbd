@@ -126,21 +126,36 @@ equations only at the position level; the tangent-space levels have none.
 
 **M1 is complete.**
 
-### M1.5 CAD-grade kinematics (proposed, pending review)
+### M1.5 CAD-grade kinematics — **done**
 What the commercial CAD motion tools have at the kinematic level that the
 seven lower pairs do not cover (benchmarked against SolidWorks Motion /
 Inventor Dynamic Simulation / Creo Mechanism, and the kinematic-only tier
 Onshape / Fusion / CATIA DMU):
-- Joint primitives (Adams JPRIM: inline, inplane, orientation, parallel
-  axes, perpendicular) so CAD mates map one to one — the vocabulary
-  `rcad-gcs::rigid3d::ConstraintKind` already has.
-- Couplers: gear, rack-and-pinion, screw, general linear coupler (one
-  velocity-ratio equation each; the Tier A gear benchmark needs it).
-- Rigid-group merging: bodies joined by `Fixed` joints collapse to one body
-  with combined mass properties before solving (fasteners dominate CAD
-  assemblies).
-- Measures: any marker's position/velocity/acceleration, relative joint
-  coordinates, in a chosen frame (trace paths, motion plots).
+- Joint primitives (Adams JPRIM: `InLine`, `InPlane`, `Orientation`,
+  `ParallelAxes`, `Perpendicular`) so CAD mates map one to one; the lower
+  pairs are exactly their combinations (same rows). **Done** — Tier A
+  (decomposed crank-slider ≡ lower pairs) + Tier B (primitive crank-slider
+  and RSUR vs OndselSolver's PointInLine/PointInPlane/NoRotation/
+  ParallelAxes/Perpendicular joints, ≤ 4e-10).
+- Couplers (Adams COUPLER `Σ cᵢ·Δqᵢ = 0` over joint coordinates relative
+  to the authored configuration): gear, rack-and-pinion, screw, general.
+  Rotation coordinates are tracked unwrapped across turns in the state
+  (`joint_angle`). **Done** — Tier A (gear pair driving the crank-slider
+  over six motor turns, rack and pinion, screw over three turns). Not
+  exported to `.asmt` (OndselSolver's gear/rack/screw couple markers, not
+  joint coordinates).
+- Rigid-group merging (`merge_fixed_groups`): welded bodies collapse to one
+  body with combined mass properties (parallel-axis theorem), placed by the
+  welds themselves; `MergedSystem::expand` maps frames back. **Done** —
+  the merged nested chain (6 coordinates fewer) still matches
+  OndselSolver's unmerged reference to 1e-14.
+- Measures (`KinematicFrame::point / marker / relative / joint_coordinate`):
+  trace paths, point and marker kinematics, Adams-style relative measures
+  expressed in a reference marker, joint coordinates with rate and
+  acceleration. **Done** — Tier A against the crank-slider closed form.
+- Left for later: a distance-between-points primitive (Ondsel
+  `SphSphJoint`), mate-level conversion from `rcad-gcs::rigid3d`
+  constraints (an M4 concern, in the assembly domain).
 
 ### M2 review note (proposed)
 The index-3 implicit route (Adams GSTIFF / HHT-α with scaling) does not

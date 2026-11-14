@@ -126,6 +126,16 @@ impl KinematicState {
         Some(t + r * local)
     }
 
+    /// Take over `other`'s tracked rotation angles for the joints both
+    /// states track (a merged system keeps the original joint ids).
+    pub(crate) fn copy_angles_from(&mut self, other: &KinematicState) {
+        for (joint, angle) in self.angles.iter_mut() {
+            if let Some(a) = other.angles.get(joint) {
+                *angle = *a;
+            }
+        }
+    }
+
     fn normalize_quaternions(&mut self) {
         for slot in 0..self.order.len() {
             let (t, r) = read_pose(&self.params, slot);
@@ -167,6 +177,35 @@ fn marker_frame(
     let (t, r) = read_pose(params, slot);
     let body = BodyMotion { t, r, v: motion[slot].linear, w: motion[slot].angular };
     body.frame(m.translation, m.rotation)
+}
+
+/// A joint coordinate with rate and acceleration at a solved frame (the
+/// measure behind [`KinematicFrame::joint_coordinate`]): the jet along the
+/// frame's velocities gives the rate and the velocity-quadratic part, the
+/// jet along its accelerations the linear part `J·q̈`.
+pub(crate) fn coordinate_motion(
+    sys: &System,
+    frame: &KinematicFrame,
+    joint: JointId,
+    slot: DriverSlot,
+) -> Option<crate::measure::JointMotion> {
+    let state = &frame.state;
+    if !state.order.iter().eq(sys.bodies.keys()) {
+        return None;
+    }
+    let vel: Vec<Twist> = state.order.iter().map(|id| frame.velocity[id]).collect();
+    let acc: Vec<Twist> = state.order.iter().map(|id| frame.acceleration[id]).collect();
+    let jv = coordinate_jet(sys, &state.slot_of, &state.params, &vel, joint, slot);
+    let ja = coordinate_jet(sys, &state.slot_of, &state.params, &acc, joint, slot);
+    let value = match slot {
+        DriverSlot::Rotation => state.angles.get(&joint).copied().unwrap_or(jv.v),
+        DriverSlot::Translation => jv.v,
+    };
+    Some(crate::measure::JointMotion {
+        value,
+        velocity: jv.d,
+        acceleration: jv.dd + ja.d,
+    })
 }
 
 /// A joint coordinate as a jet (raw: rotation in `(−π, π]`).

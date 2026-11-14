@@ -10,7 +10,29 @@
   validation gates; serde golden round-trip tests.
 - Dependency on `rcad-gcs` declared for the M1 position-level solver.
 
-## Unreleased (M1 complete)
+## Unreleased (M1 + M1.5 complete)
+
+### M1.5 CAD-grade kinematics
+
+- Joint primitives `InLine`, `InPlane`, `Orientation`, `ParallelAxes`,
+  `Perpendicular` (Adams JPRIM; CAD mates map one to one), exported to the
+  matching OndselSolver joints.
+- Couplers (`coupler` module, `System::couplers`, serde-defaulted for old
+  documents): `Σ cᵢ·Δqᵢ = 0` over joint coordinates, with `gear`,
+  `rack_pinion` and `screw` constructors; new code `bad_coupler`.
+  `KinematicState` tracks rotation coordinates unwrapped across turns
+  (`joint_angle`). Couplers are refused by the `.asmt` export.
+- Measures (`measure` module): `KinematicFrame::point`, `marker`,
+  `relative` (Adams-style, expressed in the reference marker) and
+  `joint_coordinate` (value, rate, acceleration).
+- Rigid-group merging (`merge` module): `merge_fixed_groups` collapses
+  welded bodies (combined mass properties, weld-implied placement), checks
+  weld loops and multiply-grounded groups (new code `inconsistent_weld`);
+  `MergedSystem::expand` maps frames back.
+- Tests: decomposed crank-slider ≡ lower pairs; gear pair over six motor
+  turns, rack and pinion, screw; measures against closed forms; merged
+  nested chain against OndselSolver; two primitive Tier B cases
+  (`primitive_crank_slider`, `primitive_rsur`) against OndselSolver.
 
 ### Tier B references — green
 

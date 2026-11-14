@@ -20,7 +20,13 @@ pub struct Case {
 }
 
 pub fn all() -> Vec<Case> {
-    vec![offset_crank_slider(), spatial_rsur(), nested_chain()]
+    vec![
+        offset_crank_slider(),
+        spatial_rsur(),
+        nested_chain(),
+        primitive_crank_slider(),
+        primitive_rsur(),
+    ]
 }
 
 fn body(id: u64, at: DVec3, rotation: DQuat, grounded: bool) -> Body {
@@ -239,6 +245,54 @@ fn nested_chain() -> Case {
         system: sys,
         sim: SIM,
     }
+}
+
+/// The offset crank-slider with its undriven pairs written as joint
+/// primitives: each rod revolute as spherical + parallel axes, the slider's
+/// prismatic as orientation + two in-plane relations (normals along the
+/// guide's X and Y axes, which together keep the slider on the guide line).
+fn primitive_crank_slider() -> Case {
+    let mut case = offset_crank_slider();
+    let sys = &mut case.system;
+    for (id, m1, m2) in [(2, 4, 5), (3, 6, 7)] {
+        sys.joints.get_mut(&JointId(id)).unwrap().kind = JointKind::Spherical;
+        joint(sys, 10 + id, JointKind::ParallelAxes, m1, m2);
+    }
+    let guide = sys.markers[&MarkerId(2)].clone();
+    let x1 = guide.rotation * DVec3::X;
+    let y1 = guide.rotation * DVec3::Y;
+    marker(
+        sys,
+        20,
+        1,
+        guide.translation,
+        DQuat::from_rotation_arc(DVec3::Z, x1),
+    );
+    marker(
+        sys,
+        21,
+        1,
+        guide.translation,
+        DQuat::from_rotation_arc(DVec3::Z, y1),
+    );
+    sys.joints.get_mut(&JointId(4)).unwrap().kind = JointKind::Orientation;
+    joint(sys, 15, JointKind::InPlane, 20, 8);
+    joint(sys, 16, JointKind::InPlane, 21, 8);
+    case.name = "primitive_crank_slider";
+    case
+}
+
+/// The spatial RSUR with its universal joint as spherical + perpendicular
+/// and its rocker pivot as spherical + parallel axes.
+fn primitive_rsur() -> Case {
+    let mut case = spatial_rsur();
+    let sys = &mut case.system;
+    sys.joints.get_mut(&JointId(3)).unwrap().kind = JointKind::Spherical;
+    joint(sys, 13, JointKind::Perpendicular, 5, 6);
+    sys.joints.get_mut(&JointId(4)).unwrap().kind = JointKind::Spherical;
+    joint(sys, 14, JointKind::ParallelAxes, 8, 7);
+    case.name = "primitive_rsur";
+    case
 }
 
 /// The output times of a case (`tstart + k·hout` up to `tend`).

@@ -8,6 +8,7 @@ reactions out. Pure math and data — no OCCT, no B-rep.
 |-----------|------------|-------|
 | M0 | Data model: `Body` / `Marker` / `Joint` / `Driver` / `ForceElement` / `System`, deterministic tables, `{code,detail,hint}` gates | **done** |
 | M1 | Kinematic three levels: position IC on the `rcad-gcs` Newton core, velocity and acceleration linear solves on the analytic Jacobian, redundancy diagnosis, smooth driver profiles, time sweep | **done** (Tier A closed forms + Tier B OndselSolver references, ≤ 4e-10) |
+| M1.5 | CAD-grade kinematics: joint primitives (mate vocabulary), gear / rack-pinion / screw couplers, rigid-group merging, measures | **done** |
 | M2 | Forward dynamics + BDF integration + joint-reaction recovery | planned |
 | M3 | Force library: gravity, spring-damper, torque, applied loads | planned |
 | M4 | Assembly wiring (Assembly → system conversion, tool surface) | planned |

@@ -461,3 +461,46 @@ fn coupler_validation() {
         codes::DUPLICATE_ID
     );
 }
+
+// ── measures ────────────────────────────────────────────────────────────
+
+/// Point, marker, relative and joint-coordinate measures on the
+/// crank-slider against closed forms: the crank tip runs a circle, the
+/// slider's prismatic coordinate and its relative displacement from the
+/// crank pivot are `x(θ)`, the crank's joint angle runs on unwrapped.
+#[test]
+fn measures_match_closed_forms() {
+    let sys = crank_slider();
+    for frame in kinematic_sweep(&sys, &grid(2.5, 0.05)).unwrap() {
+        let t = frame.time;
+        let theta = THETA0 + OMEGA * t;
+        let (s, c) = theta.sin_cos();
+        let tip = frame.point(BodyId(2), DVec3::new(R, 0.0, 0.0)).unwrap();
+        assert!((tip.position - R * DVec3::new(c, s, 0.0)).length() < 1e-10, "t={t}");
+        assert!((tip.velocity - R * OMEGA * DVec3::new(-s, c, 0.0)).length() < 1e-8, "t={t}");
+        assert!((tip.acceleration + R * OMEGA * OMEGA * DVec3::new(c, s, 0.0)).length() < 1e-6, "t={t}");
+        // The crank-tip marker reads the same point.
+        let m4 = frame.marker(&sys, MarkerId(4)).unwrap();
+        assert!((m4.position - tip.position).length() < 1e-12);
+        assert!((m4.velocity.angular - DVec3::Z * OMEGA).length() < 1e-8);
+
+        let (x, dx, ddx) = slider_closed_form(theta);
+        let q = frame.joint_coordinate(&sys, JointId(4), DriverSlot::Translation).unwrap();
+        assert!((q.value - x).abs() < 1e-9, "t={t}: {} vs {x}", q.value);
+        assert!((q.velocity - OMEGA * dx).abs() < 1e-7, "t={t}");
+        assert!((q.acceleration - OMEGA * OMEGA * ddx).abs() < 1e-5, "t={t}");
+        // Slider marker relative to the crank pivot, expressed in the pivot
+        // marker's (world-aligned) axes.
+        let rel = frame.relative(&sys, MarkerId(1), MarkerId(7)).unwrap();
+        assert!((rel.displacement - DVec3::new(x, 0.0, 0.0)).length() < 1e-9, "t={t}");
+        assert!((rel.velocity.x - OMEGA * dx).abs() < 1e-7);
+        assert!((rel.acceleration.x - OMEGA * OMEGA * ddx).abs() < 1e-5);
+
+        let crank = frame.joint_coordinate(&sys, JointId(1), DriverSlot::Rotation).unwrap();
+        assert!((crank.value - theta).abs() < 1e-9, "t={t}: unwrapped {} vs {theta}", crank.value);
+        assert!((crank.velocity - OMEGA).abs() < 1e-8 && crank.acceleration.abs() < 1e-6);
+    }
+    let frame = solve_frame(&sys, 0.0, None).unwrap();
+    assert!(frame.joint_coordinate(&sys, JointId(1), DriverSlot::Translation).is_none());
+    assert!(frame.point(BodyId(99), DVec3::ZERO).is_none());
+}

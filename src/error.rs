@@ -58,6 +58,10 @@ pub mod codes {
     /// A coupler has no terms, a zero or non-finite coefficient, or a term on
     /// a coordinate its joint kind does not have.
     pub const BAD_COUPLER: &str = "bad_coupler";
+    /// Fixed joints that cannot all hold: a weld loop inside a rigid group
+    /// disagrees with the tree placement, or two grounded bodies are welded
+    /// off their authored poses.
+    pub const INCONSISTENT_WELD: &str = "inconsistent_weld";
     /// The system uses something the `.asmt` export does not cover.
     pub const ASMT_UNSUPPORTED: &str = "asmt_unsupported";
 }
