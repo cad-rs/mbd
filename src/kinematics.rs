@@ -435,7 +435,7 @@ impl<'a> Problem<'a> {
 
     /// A joint coordinate as a jet, rotation unwrapped against its
     /// reference.
-    fn coordinate(&self, params: &[f64], motion: &[Twist], joint: JointId, slot: DriverSlot) -> Jet {
+    pub(crate) fn coordinate(&self, params: &[f64], motion: &[Twist], joint: JointId, slot: DriverSlot) -> Jet {
         let mut jet = self.raw(params, motion, joint, slot);
         if slot == DriverSlot::Rotation {
             let reference = self.angle_reference(joint);
@@ -990,6 +990,7 @@ mod tests {
             stiffness: 100.0,
             damping: 1.0,
             free_length: 0.0,
+            preload: 0.0,
         })
         .unwrap();
         assert!(sys.validate().is_ok());

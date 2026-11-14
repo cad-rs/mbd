@@ -211,10 +211,22 @@ Cards (one commit each):
 - Estimate: the largest card on the route (the gap doc's T4 estimate of 4+
   weeks is reasonable).
 
-### M3 Force library
+### M3 Force library — in progress
 Gravity / linear spring-damper / torsional spring / applied force-torque
 (time- and state-functions). Gates: Tier A spring-mass (ω=√(k/m)), forced
 oscillation, energy audit.
+
+Cards:
+1. **Done** — function forces (`Function` = `DriverProfile` curve of time,
+   joint coordinate / rate, marker distance / rate), `Force` / `Torque`
+   (world or reference-frame direction: follower loads), `LineForce`,
+   spring preload, `power` (work-energy audit). Tier A: forced oscillation
+   amplitude/phase in three regimes, follower vs world-fixed equilibria,
+   torsional pendulum, work-energy theorem (second order in h).
+2. Joint spring-dampers on joint coordinates (rotation multi-turn,
+   translation; Inventor joint springs), 6-DOF bushing (Adams BUSHING),
+   their potentials; Tier A torsional pendulum / winding, bushing
+   deflection and frequency.
 
 ### M4 Assembly-domain wiring (document/session/tool surface)
 Assembly → mbd system conversion (instances + mass properties → Body;

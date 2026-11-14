@@ -79,4 +79,7 @@ pub mod codes {
     pub const BAD_INTEGRATOR_SETTINGS: &str = "bad_integrator_settings";
     /// The integrator could not complete a step even at its minimum step.
     pub const INTEGRATION_FAILED: &str = "integration_failed";
+    /// A force element's numbers are unusable (non-finite parameters, a
+    /// zero direction, an invalid curve).
+    pub const BAD_FORCE_ELEMENT: &str = "bad_force_element";
 }

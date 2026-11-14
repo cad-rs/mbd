@@ -47,11 +47,12 @@ pub use body::{Body, BodyId, Marker, MarkerId};
 pub use coupler::{Coupler, CouplerId, CouplerTerm};
 pub use driver::{Driver, DriverProfile, DriverSample, DriverSlot};
 pub use dynamics::{
-    dynamic_ic, energy, forward_dynamics, mass_matrix, momentum, static_equilibrium, velocity_ic, DynamicFrame,
+    dynamic_ic, energy, forward_dynamics, mass_matrix, momentum, power, static_equilibrium, velocity_ic,
+    DynamicFrame,
     Energy, Momentum, StaticEquilibrium,
 };
 pub use error::{codes, MbdError};
-pub use force::{ForceElement, ForceId};
+pub use force::{Argument, ForceElement, ForceId, Function};
 pub use integrate::{simulate, HhtSettings, IntegrationStats, Simulation, DEFAULT_ALPHA};
 pub use joint::{Joint, JointId, JointKind};
 pub use kinematics::{
@@ -131,6 +132,7 @@ mod tests {
             stiffness: 100.0,
             damping: 1.0,
             free_length: 0.0,
+            preload: 0.0,
         })
         .unwrap();
         sys

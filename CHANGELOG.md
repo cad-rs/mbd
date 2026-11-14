@@ -10,7 +10,34 @@
   validation gates; serde golden round-trip tests.
 - Dependency on `rcad-gcs` declared for the M1 position-level solver.
 
-## Unreleased (M1 + M1.5 + M2 complete)
+## Unreleased (M1 + M1.5 + M2 complete, M3 in progress)
+
+### M3 card 1 — function forces, follower loads, preload, work audit
+
+- `force::Function { argument, curve }`: any `DriverProfile` as a curve
+  of `Argument::Time`, `JointCoordinate` / `JointRate` (rotation unwrapped
+  across turns), `Distance` / `DistanceRate` between markers
+  (constructors `constant`, `linear`, `of_time`) — the SolidWorks Motion
+  force-function / Adams function-expression subset CAD users reach for.
+- New elements: `Force` (action-only, unit direction in a reference
+  marker's frame or the world — a reference on the loaded body is a
+  follower force), `Torque` (same for moments), `LineForce` (action-
+  reaction along the marker line, Adams translational SFORCE).
+  `SpringDamper::preload` (Adams convention, pushes apart; serde-defaulted)
+  with its potential in `energy`. `ForceElement::name` / `check` /
+  `measured_joint`; validation of curves, directions and measured joints
+  (new code `bad_force_element`).
+- `power(sys, time, state, velocity)`: `Σ Q·v` of all applied loads — the
+  work-energy audit.
+- Tier A (`tests/force_benchmarks.rs`): forced damped oscillation at
+  Ω/ω = 0.5 / 1 / 2 against the steady-state amplitude and phase
+  (≤ 4e-5 of X at resonance); follower vs world-fixed push
+  (sin θ vs tan θ equilibria, 1e-10); torque linear in the hinge angle =
+  torsional pendulum ω = √(k/I_o); line forces of distance and rate
+  reproduce the preloaded spring-damper to 1e-12; preloaded static
+  extension `l₀ + (mg + P)/k` and energy conservation; work-energy theorem
+  with shaker + rate-dependent drag, error second order in h (1.4e-6 →
+  3.6e-7 J of 2.2 J); validation codes and serde round trip.
 
 ### M2 card 4 — variable step, momentum audit (M2 complete)
 
@@ -212,6 +239,5 @@
 
 ### Next
 
-- M3 force library (torsional spring, time/state-function forces, forced
-  oscillation and energy audits); performance (sparse Jacobian, analytic
+- M3 card 2: joint spring-dampers (multi-turn), bushings; then performance (sparse Jacobian, analytic
   iteration matrix) once systems pass ~100 bodies.

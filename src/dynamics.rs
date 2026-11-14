@@ -39,9 +39,9 @@ use std::collections::BTreeMap;
 
 use glam::{DMat3, DQuat, DVec3};
 
-use crate::body::{Body, BodyId};
+use crate::body::{Body, BodyId, MarkerId};
 use crate::error::{codes, MbdError};
-use crate::force::ForceElement;
+use crate::force::{Argument, ForceElement, Function};
 use crate::kinematics::{
     check_state, describe, position_ic, position_ic_from, read_pose, EquationOwner, EquationRef,
     KinematicState, Problem, Twist, BODY_PARAMS, BODY_TWIST,
@@ -302,6 +302,7 @@ pub(crate) fn applied_forces(
                 stiffness,
                 damping,
                 free_length,
+                preload,
             } => {
                 let p1 = problem.frame(params, vel, *marker1).p;
                 let p2 = problem.frame(params, vel, *marker2).p;
@@ -311,8 +312,8 @@ pub(crate) fn applied_forces(
                 // Tension along marker 1 → marker 2 (pulls marker 1 toward 2).
                 let tension = if l > LENGTH_EPS {
                     let u = d / l;
-                    (stiffness * (l - free_length) + damping * u.dot(rate)) * u
-                } else if free_length.abs() <= LENGTH_EPS {
+                    (stiffness * (l - free_length) + damping * u.dot(rate) - preload) * u
+                } else if free_length.abs() <= LENGTH_EPS && *preload == 0.0 {
                     // A zero-length spring is isotropic: f = k·d + c·ḋ.
                     *stiffness * d + *damping * rate
                 } else {
@@ -336,9 +337,112 @@ pub(crate) fn applied_forces(
                 let slot = problem.slot_of[&sys.markers[marker].body];
                 q[slot].angular += *torque;
             }
+            ForceElement::Force {
+                marker,
+                reference,
+                direction,
+                magnitude,
+                ..
+            } => {
+                let f = evaluate(problem, params, vel, magnitude)?;
+                let dir = world_direction(problem, params, *reference, *direction);
+                let p = problem.frame(params, vel, *marker).p.v;
+                point_force(&mut q, *marker, p, f * dir);
+            }
+            ForceElement::Torque {
+                marker,
+                reference,
+                direction,
+                magnitude,
+                ..
+            } => {
+                let t = evaluate(problem, params, vel, magnitude)?;
+                let dir = world_direction(problem, params, *reference, *direction);
+                let slot = problem.slot_of[&sys.markers[marker].body];
+                q[slot].angular += t * dir;
+            }
+            ForceElement::LineForce {
+                id,
+                name,
+                marker1,
+                marker2,
+                tension,
+            } => {
+                let t = evaluate(problem, params, vel, tension)?;
+                let p1 = problem.frame(params, vel, *marker1).p.v;
+                let p2 = problem.frame(params, vel, *marker2).p.v;
+                let d = p2 - p1;
+                let l = d.length();
+                if l <= LENGTH_EPS {
+                    if t != 0.0 {
+                        return Err(MbdError::new(
+                            codes::DEGENERATE_FORCE,
+                            format!(
+                                "line force {} ({name}) has coincident markers and tension {t}: its line of action is undefined",
+                                id.0
+                            ),
+                            "separate the markers",
+                        ));
+                    }
+                    continue;
+                }
+                let pull = t * d / l;
+                point_force(&mut q, *marker1, p1, pull);
+                point_force(&mut q, *marker2, p2, -pull);
+            }
         }
     }
     Ok(q)
+}
+
+/// A unit direction given in a reference marker's frame (`None`: world),
+/// in world coordinates.
+fn world_direction(problem: &Problem, params: &[f64], reference: Option<MarkerId>, direction: DVec3) -> DVec3 {
+    let unit = direction.normalize();
+    let Some(r) = reference else { return unit };
+    let rest = vec![Twist::default(); problem.n_bodies()];
+    let f = problem.frame(params, &rest, r);
+    unit.x * f.x.v + unit.y * f.y.v + unit.z * f.z.v
+}
+
+/// A force function at the state `(params, vel)` and the problem's time.
+fn evaluate(problem: &Problem, params: &[f64], vel: &[Twist], function: &Function) -> Result<f64, MbdError> {
+    let x = match function.argument {
+        Argument::Time => problem.time,
+        Argument::JointCoordinate { joint, slot } => problem.coordinate(params, vel, joint, slot).v,
+        Argument::JointRate { joint, slot } => problem.coordinate(params, vel, joint, slot).d,
+        Argument::Distance { marker1, marker2 } | Argument::DistanceRate { marker1, marker2 } => {
+            let p1 = problem.frame(params, vel, marker1).p;
+            let p2 = problem.frame(params, vel, marker2).p;
+            let d = p2.v - p1.v;
+            let l = d.length();
+            if matches!(function.argument, Argument::Distance { .. }) {
+                l
+            } else if l > LENGTH_EPS {
+                d.dot(p2.d - p1.d) / l
+            } else {
+                0.0
+            }
+        }
+    };
+    Ok(function.at(x))
+}
+
+/// The power of every applied force (gravity and the force elements) at a
+/// state, `Σ Q·v` (W). With scleronomic constraints the constraint forces do
+/// no work, so `dT/dt` equals it — the work-energy audit.
+pub fn power(
+    sys: &System,
+    time: f64,
+    state: &KinematicState,
+    velocity: &BTreeMap<BodyId, Twist>,
+) -> Result<f64, MbdError> {
+    sys.validate()?;
+    check_state(sys, state)?;
+    let problem = Problem::new(sys, time, &state.angles);
+    let vel = slot_twists(&problem, velocity);
+    let q = flatten(&problem, &applied_forces(&problem, &state.params, &vel)?);
+    Ok(q.iter().zip(flatten(&problem, &vel)).map(|(a, b)| a * b).sum())
 }
 
 /// Per-row driver velocity and acceleration (zero for joint and coupler
@@ -753,8 +857,9 @@ pub fn static_equilibrium(
     ))
 }
 
-/// The energy of a state: kinetic `½·vᵀMv`, gravitational `−m·g·x_com`
-/// and the springs' `½·k·(l − l₀)²`.
+/// The energy of a state: kinetic `½·vᵀMv`, gravitational `−m·g·x_com`,
+/// the springs' `½·k·(l − l₀)² − preload·(l − l₀)`. Function forces are not
+/// potentials (their work is audited through [`power`]).
 pub fn energy(
     sys: &System,
     state: &KinematicState,
@@ -787,13 +892,14 @@ pub fn energy(
             marker2,
             stiffness,
             free_length,
+            preload,
             ..
         } = element
         {
             let p1 = problem.frame(params, &rest, *marker1).p.v;
             let p2 = problem.frame(params, &rest, *marker2).p.v;
             let stretch = (p2 - p1).length() - free_length;
-            e.elastic += 0.5 * stiffness * stretch * stretch;
+            e.elastic += 0.5 * stiffness * stretch * stretch - preload * stretch;
         }
     }
     Ok(e)

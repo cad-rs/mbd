@@ -299,6 +299,7 @@ fn spring_mass(x: f64, damping: f64) -> System {
         stiffness: K,
         damping,
         free_length: FREE,
+        preload: 0.0,
     })
     .unwrap();
     sys
@@ -384,6 +385,7 @@ fn static_spring_extension() {
         stiffness: K,
         damping: 5.0,
         free_length: FREE,
+        preload: 0.0,
     })
     .unwrap();
     let eq = static_equilibrium(&sys, 0.0, None).unwrap();

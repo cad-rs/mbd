@@ -151,6 +151,32 @@ impl System {
                     ));
                 }
             }
+            if let Err(why) = force.check() {
+                return Err(MbdError::new(
+                    codes::BAD_FORCE_ELEMENT,
+                    format!("force element {} ({}): {why}", force.id().0, force.name()),
+                    "give finite parameters, a non-zero direction and a valid curve",
+                ));
+            }
+            if let Some((joint, slot)) = force.measured_joint() {
+                let Some(j) = self.joints.get(&joint) else {
+                    return Err(MbdError::new(
+                        codes::DANGLING_JOINT,
+                        format!("force element {} measures missing joint {}", force.id().0, joint.0),
+                        "add the joint before measuring it",
+                    ));
+                };
+                if !j.kind.drives(slot) {
+                    return Err(MbdError::new(
+                        codes::SLOT_UNSUPPORTED,
+                        format!(
+                            "force element {} measures {slot:?}, not a coordinate of {:?} joint {}",
+                            force.id().0, j.kind, joint.0
+                        ),
+                        "measure a rotation (revolute, cylindrical, planar) or translation (prismatic, cylindrical) coordinate",
+                    ));
+                }
+            }
         }
         let mut driven = BTreeSet::new();
         for driver in &self.drivers {
