@@ -36,4 +36,7 @@ pub mod codes {
     pub const BAD_MASS_PROPERTIES: &str = "bad_mass_properties";
     /// Two entities share one id in a table.
     pub const DUPLICATE_ID: &str = "duplicate_id";
+    /// The kinematic position solve did not converge below the residual
+    /// tolerance (over-constrained layout or a bad seed).
+    pub const KINEMATICS_NOT_CONVERGED: &str = "kinematics_not_converged";
 }

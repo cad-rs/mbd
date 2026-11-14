@@ -23,12 +23,14 @@ pub mod body;
 pub mod error;
 pub mod force;
 pub mod joint;
+pub mod kinematics;
 pub mod system;
 
 pub use body::{Body, BodyId, Marker, MarkerId};
 pub use error::{codes, MbdError};
 pub use force::{ForceElement, ForceId};
 pub use joint::{Driver, DriverProfile, DriverSlot, Joint, JointId, JointKind};
+pub use kinematics::{equation_count, position_ic, KinematicState, BODY_PARAMS};
 pub use system::{System, STANDARD_GRAVITY};
 
 #[cfg(test)]

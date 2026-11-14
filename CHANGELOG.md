@@ -9,3 +9,16 @@
   `System` with deterministic `BTreeMap` tables and `{code,detail,hint}`
   validation gates; serde golden round-trip tests.
 - Dependency on `rcad-gcs` declared for the M1 position-level solver.
+
+## Unreleased (M1 first slice)
+
+- `kinematics` module: the flat per-body pose state (translation +
+  quaternion), the joint constraint residuals for all seven joint kinds
+  (revolute / prismatic / cylindrical / spherical / planar / universal /
+  fixed), the driver equations, and the position initial condition as a
+  damped Newton-Raphson solve on `rcad-gcs::numerics::newton_solve`.
+- Tests: residual layout consistency, the driver angle held by the solve
+  for a hinge, the suppressed-joint layout, and the validation gates.
+- Next: the velocity and acceleration levels (linear solves against the
+  same constraint Jacobian), then the four-bar / crank-slider analytic
+  benchmarks and the OndselSolver `.asmt` reference poses.
