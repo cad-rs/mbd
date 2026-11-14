@@ -173,6 +173,47 @@ pub enum ForceElement {
         marker2: MarkerId,
         tension: Function,
     },
+    /// A spring-damper on a joint coordinate (Inventor joint spring, the
+    /// SolidWorks torsional spring on a hinge): generalized force
+    /// `−k·(q − q₀) − c·q̇ + preload` along the coordinate (torque for
+    /// rotation, force for translation). Rotation is measured unwrapped
+    /// across turns, so the spring winds any number of revolutions.
+    JointSpringDamper {
+        id: ForceId,
+        name: String,
+        joint: JointId,
+        slot: DriverSlot,
+        /// N·m/rad or N/m.
+        stiffness: f64,
+        /// N·m·s/rad or N·s/m.
+        damping: f64,
+        /// The coordinate at which the spring is relaxed (rad / m).
+        free_value: f64,
+        /// Generalized force at the free value, driving the coordinate up.
+        #[serde(default, skip_serializing_if = "is_zero")]
+        preload: f64,
+    },
+    /// A 6-DOF linear bushing (Adams `BUSHING`) between markers I
+    /// (`marker1`) and J: with `d` the displacement of J's origin from I's
+    /// and `θ` the rotation vector of J relative to I, both in I's axes,
+    /// the force on J is `−K·d − C·ḋ` and the torque `−K_t·θ − C_t·ω_rel`
+    /// (diagonal stiffness / damping per I axis; the equal and opposite
+    /// load acts on I at the same point). A small-deflection element, as in
+    /// the commercial tools: exact for rotation about one I axis.
+    Bushing {
+        id: ForceId,
+        name: String,
+        marker1: MarkerId,
+        marker2: MarkerId,
+        /// N/m per I axis.
+        stiffness: DVec3,
+        /// N·s/m per I axis.
+        damping: DVec3,
+        /// N·m/rad per I axis.
+        torsion_stiffness: DVec3,
+        /// N·m·s/rad per I axis.
+        torsion_damping: DVec3,
+    },
 }
 
 fn is_zero(v: &f64) -> bool {
@@ -187,7 +228,9 @@ impl ForceElement {
             | ForceElement::AppliedTorque { id, .. }
             | ForceElement::Force { id, .. }
             | ForceElement::Torque { id, .. }
-            | ForceElement::LineForce { id, .. } => *id,
+            | ForceElement::LineForce { id, .. }
+            | ForceElement::JointSpringDamper { id, .. }
+            | ForceElement::Bushing { id, .. } => *id,
         }
     }
 
@@ -198,7 +241,9 @@ impl ForceElement {
             | ForceElement::AppliedTorque { name, .. }
             | ForceElement::Force { name, .. }
             | ForceElement::Torque { name, .. }
-            | ForceElement::LineForce { name, .. } => name,
+            | ForceElement::LineForce { name, .. }
+            | ForceElement::JointSpringDamper { name, .. }
+            | ForceElement::Bushing { name, .. } => name,
         }
     }
 
@@ -207,7 +252,11 @@ impl ForceElement {
         match self {
             ForceElement::SpringDamper {
                 marker1, marker2, ..
+            }
+            | ForceElement::Bushing {
+                marker1, marker2, ..
             } => vec![*marker1, *marker2],
+            ForceElement::JointSpringDamper { .. } => Vec::new(),
             ForceElement::AppliedForce { marker, .. }
             | ForceElement::AppliedTorque { marker, .. } => {
                 vec![*marker]
@@ -244,6 +293,9 @@ impl ForceElement {
 
     /// The joint coordinate a function measures, if any (for validation).
     pub fn measured_joint(&self) -> Option<(JointId, DriverSlot)> {
+        if let ForceElement::JointSpringDamper { joint, slot, .. } = self {
+            return Some((*joint, *slot));
+        }
         self.function().and_then(Function::joint)
     }
 
@@ -287,6 +339,34 @@ impl ForceElement {
                 }
             }
             ForceElement::LineForce { .. } => {}
+            ForceElement::JointSpringDamper {
+                stiffness,
+                damping,
+                free_value,
+                preload,
+                ..
+            } => {
+                if ![*stiffness, *damping, *free_value, *preload]
+                    .iter()
+                    .all(|v| v.is_finite())
+                {
+                    return Err("non-finite joint spring-damper parameters");
+                }
+            }
+            ForceElement::Bushing {
+                stiffness,
+                damping,
+                torsion_stiffness,
+                torsion_damping,
+                ..
+            } => {
+                if ![stiffness, damping, torsion_stiffness, torsion_damping]
+                    .iter()
+                    .all(|v| v.is_finite())
+                {
+                    return Err("non-finite bushing parameters");
+                }
+            }
         }
         if let Some(f) = self.function() {
             f.curve.check()?;

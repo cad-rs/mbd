@@ -53,7 +53,7 @@ use crate::system::System;
 const LENGTH_EPS: f64 = 1.0e-12;
 
 /// Static equilibrium: Newton iteration cap.
-const STATIC_MAX_ITER: usize = 60;
+const STATIC_MAX_ITER: usize = 200;
 
 /// Static equilibrium: force-balance tolerance relative to the load scale.
 const STATIC_FORCE_TOL: f64 = 1.0e-9;
@@ -390,14 +390,149 @@ pub(crate) fn applied_forces(
                 point_force(&mut q, *marker1, p1, pull);
                 point_force(&mut q, *marker2, p2, -pull);
             }
+            ForceElement::JointSpringDamper {
+                joint,
+                slot,
+                stiffness,
+                damping,
+                free_value,
+                preload,
+                ..
+            } => {
+                if sys.joints[joint].suppressed {
+                    continue;
+                }
+                let c = problem.coordinate(params, vel, *joint, *slot);
+                let f = -stiffness * (c.v - free_value) - damping * c.d + preload;
+                for (s, grad) in coordinate_gradient(problem, params, *joint, *slot) {
+                    q[s].linear += f * grad.linear;
+                    q[s].angular += f * grad.angular;
+                }
+            }
+            ForceElement::Bushing {
+                marker1,
+                marker2,
+                stiffness,
+                damping,
+                torsion_stiffness,
+                torsion_damping,
+                ..
+            } => {
+                let b = bushing_state(problem, params, vel, *marker1, *marker2);
+                let force_i = -(*stiffness * b.d + *damping * b.d_rate);
+                let torque_i = -(*torsion_stiffness * b.theta + *torsion_damping * b.w_rel);
+                let force = b.axes * force_i;
+                let torque = b.axes * torque_i;
+                // On J at its origin; the reaction on I at the same point.
+                point_force(&mut q, *marker2, b.p_j, force);
+                point_force(&mut q, *marker1, b.p_j, -force);
+                let (sj, si) = (
+                    problem.slot_of[&sys.markers[marker2].body],
+                    problem.slot_of[&sys.markers[marker1].body],
+                );
+                q[sj].angular += torque;
+                q[si].angular -= torque;
+            }
         }
     }
     Ok(q)
 }
 
+/// `∂q/∂(v, ω)` of a joint coordinate for each free body of the joint —
+/// the direction along which a generalized force on the coordinate acts.
+fn coordinate_gradient(
+    problem: &Problem,
+    params: &[f64],
+    joint: crate::joint::JointId,
+    slot: crate::driver::DriverSlot,
+) -> Vec<(usize, Twist)> {
+    let sys = problem.sys;
+    let j = &sys.joints[&joint];
+    let mut slots = vec![
+        problem.slot_of[&sys.markers[&j.marker1].body],
+        problem.slot_of[&sys.markers[&j.marker2].body],
+    ];
+    slots.dedup();
+    let mut motion = vec![Twist::default(); problem.n_bodies()];
+    let mut out = Vec::new();
+    for s in slots {
+        if problem.col_of[s].is_none() {
+            continue;
+        }
+        let mut g = Twist::default();
+        for (dir, unit) in unit_twists().into_iter().enumerate() {
+            motion[s] = unit;
+            let d = problem.coordinate(params, &motion, joint, slot).d;
+            if dir < 3 {
+                g.linear[dir] = d;
+            } else {
+                g.angular[dir - 3] = d;
+            }
+        }
+        motion[s] = Twist::default();
+        out.push((s, g));
+    }
+    out
+}
+
+/// A bushing's deflection state, in marker I's axes.
+struct BushingState {
+    /// Marker I's axes (columns), world frame.
+    axes: DMat3,
+    /// Displacement of J's origin from I's, and its rate as seen from I.
+    d: DVec3,
+    d_rate: DVec3,
+    /// Rotation vector of J relative to I, and the relative angular velocity.
+    theta: DVec3,
+    w_rel: DVec3,
+    /// J's origin, world frame.
+    p_j: DVec3,
+}
+
+fn bushing_state(
+    problem: &Problem,
+    params: &[f64],
+    vel: &[Twist],
+    m1: MarkerId,
+    m2: MarkerId,
+) -> BushingState {
+    let sys = problem.sys;
+    let (fi, fj) = (
+        problem.frame(params, vel, m1),
+        problem.frame(params, vel, m2),
+    );
+    let axes = DMat3::from_cols(fi.x.v, fi.y.v, fi.z.v);
+    let orientation = |m: MarkerId| {
+        let marker = &sys.markers[&m];
+        let slot = problem.slot_of[&marker.body];
+        (slot, read_pose(params, slot).1 * marker.rotation)
+    };
+    let ((si, ri), (sj, rj)) = (orientation(m1), orientation(m2));
+    let mut rel = ri.inverse() * rj;
+    if rel.w < 0.0 {
+        rel = -rel;
+    }
+    let dw = fj.p.v - fi.p.v;
+    let (wi, wj) = (vel[si].angular, vel[sj].angular);
+    let back = axes.transpose();
+    BushingState {
+        axes,
+        d: back * dw,
+        d_rate: back * (fj.p.d - fi.p.d - wi.cross(dw)),
+        theta: rel.to_scaled_axis(),
+        w_rel: back * (wj - wi),
+        p_j: fj.p.v,
+    }
+}
+
 /// A unit direction given in a reference marker's frame (`None`: world),
 /// in world coordinates.
-fn world_direction(problem: &Problem, params: &[f64], reference: Option<MarkerId>, direction: DVec3) -> DVec3 {
+fn world_direction(
+    problem: &Problem,
+    params: &[f64],
+    reference: Option<MarkerId>,
+    direction: DVec3,
+) -> DVec3 {
     let unit = direction.normalize();
     let Some(r) = reference else { return unit };
     let rest = vec![Twist::default(); problem.n_bodies()];
@@ -406,7 +541,12 @@ fn world_direction(problem: &Problem, params: &[f64], reference: Option<MarkerId
 }
 
 /// A force function at the state `(params, vel)` and the problem's time.
-fn evaluate(problem: &Problem, params: &[f64], vel: &[Twist], function: &Function) -> Result<f64, MbdError> {
+fn evaluate(
+    problem: &Problem,
+    params: &[f64],
+    vel: &[Twist],
+    function: &Function,
+) -> Result<f64, MbdError> {
     let x = match function.argument {
         Argument::Time => problem.time,
         Argument::JointCoordinate { joint, slot } => problem.coordinate(params, vel, joint, slot).v,
@@ -442,7 +582,10 @@ pub fn power(
     let problem = Problem::new(sys, time, &state.angles);
     let vel = slot_twists(&problem, velocity);
     let q = flatten(&problem, &applied_forces(&problem, &state.params, &vel)?);
-    Ok(q.iter().zip(flatten(&problem, &vel)).map(|(a, b)| a * b).sum())
+    Ok(q.iter()
+        .zip(flatten(&problem, &vel))
+        .map(|(a, b)| a * b)
+        .sum())
 }
 
 /// Per-row driver velocity and acceleration (zero for joint and coupler
@@ -762,7 +905,7 @@ pub fn static_equilibrium(
         Some(seed) => position_ic_from(sys, time, seed)?,
         None => position_ic(sys, time)?,
     };
-    let problem = Problem::new(sys, time, &state.angles);
+    let mut problem = Problem::new(sys, time, &state.angles);
     let n = problem.n_cols;
     let m = problem.rows.len();
     let mut params = state.params.clone();
@@ -836,6 +979,10 @@ pub fn static_equilibrium(
                 params = trial;
                 lambda = trial_lambda;
                 accepted = true;
+                // Re-anchor the angle unwrapping on the new pose, so a joint
+                // spring may wind past half a turn on the way.
+                let refs = problem.track_angles(&params);
+                problem = Problem::new(sys, time, &refs);
                 break;
             }
             scale *= 0.5;
@@ -858,7 +1005,8 @@ pub fn static_equilibrium(
 }
 
 /// The energy of a state: kinetic `½·vᵀMv`, gravitational `−m·g·x_com`,
-/// the springs' `½·k·(l − l₀)² − preload·(l − l₀)`. Function forces are not
+/// the springs' `½·k·(l − l₀)² − preload·(l − l₀)` (joint springs alike,
+/// bushings `½·dᵀK·d + ½·θᵀK_t·θ`). Function forces are not
 /// potentials (their work is audited through [`power`]).
 pub fn energy(
     sys: &System,
@@ -887,19 +1035,55 @@ pub fn energy(
     }
     let rest = vec![Twist::default(); problem.n_bodies()];
     for element in sys.forces.values() {
-        if let ForceElement::SpringDamper {
-            marker1,
-            marker2,
-            stiffness,
-            free_length,
-            preload,
-            ..
-        } = element
-        {
-            let p1 = problem.frame(params, &rest, *marker1).p.v;
-            let p2 = problem.frame(params, &rest, *marker2).p.v;
-            let stretch = (p2 - p1).length() - free_length;
-            e.elastic += 0.5 * stiffness * stretch * stretch - preload * stretch;
+        match element {
+            ForceElement::SpringDamper {
+                marker1,
+                marker2,
+                stiffness,
+                free_length,
+                preload,
+                ..
+            } => {
+                let p1 = problem.frame(params, &rest, *marker1).p.v;
+                let p2 = problem.frame(params, &rest, *marker2).p.v;
+                let stretch = (p2 - p1).length() - free_length;
+                e.elastic += 0.5 * stiffness * stretch * stretch - preload * stretch;
+            }
+            ForceElement::JointSpringDamper {
+                joint,
+                slot,
+                stiffness,
+                free_value,
+                preload,
+                ..
+            } => {
+                if sys.joints[joint].suppressed {
+                    continue;
+                }
+                // The tracked (unwrapped) angle for rotation.
+                let q = match slot {
+                    crate::driver::DriverSlot::Rotation => {
+                        state.joint_angle(*joint).unwrap_or_default()
+                    }
+                    crate::driver::DriverSlot::Translation => {
+                        problem.coordinate(params, &rest, *joint, *slot).v
+                    }
+                };
+                let s = q - free_value;
+                e.elastic += 0.5 * stiffness * s * s - preload * s;
+            }
+            ForceElement::Bushing {
+                marker1,
+                marker2,
+                stiffness,
+                torsion_stiffness,
+                ..
+            } => {
+                let b = bushing_state(&problem, params, &rest, *marker1, *marker2);
+                e.elastic += 0.5 * (b.d * *stiffness).dot(b.d)
+                    + 0.5 * (b.theta * *torsion_stiffness).dot(b.theta);
+            }
+            _ => {}
         }
     }
     Ok(e)

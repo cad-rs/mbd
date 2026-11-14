@@ -10,7 +10,28 @@
   validation gates; serde golden round-trip tests.
 - Dependency on `rcad-gcs` declared for the M1 position-level solver.
 
-## Unreleased (M1 + M1.5 + M2 complete, M3 in progress)
+## Unreleased (M1 + M1.5 + M2 + M3 complete)
+
+### M3 card 2 — joint spring-dampers, bushings (M3 complete)
+
+- `ForceElement::JointSpringDamper` on a joint coordinate (rotation or
+  translation; Inventor joint spring / SolidWorks hinge torsion spring):
+  `−k·(q − q₀) − c·q̇ + preload` applied through the coordinate's exact
+  tangent gradient (jets), rotation unwrapped across turns — winds any
+  number of revolutions. Inactive while its joint is suppressed.
+- `ForceElement::Bushing` (Adams BUSHING): diagonal translational and
+  torsional stiffness / damping in marker I's axes on the displacement and
+  rotation vector of J relative to I (rate as seen from I); reaction on I
+  at the same point. Small-deflection element, exact about one I axis.
+- `energy` carries both potentials; `static_equilibrium` re-anchors the
+  angle unwrapping after every Newton step (a spring may wind past half a
+  turn on the way) and allows 200 iterations.
+- Tier A: damped torsional pendulum on a hinge spring (≤ 1e-5 of θ₀);
+  static winding to 6π + 0.5 rad and a dynamic 2.5-turn winding (peak
+  1e-5, energy 1e-5); prismatic joint spring ≡ line spring-damper (1e-10);
+  bushing static deflection `d_y = −mg/k_y`, `θ_z = T/k_tz` (1e-12);
+  bushing translational / torsional vibration at `√(k/m)` / `√(k_t/I)`
+  (1e-7) with energy conserved to 1e-14; validation and serde.
 
 ### M3 card 1 — function forces, follower loads, preload, work audit
 
@@ -239,5 +260,5 @@
 
 ### Next
 
-- M3 card 2: joint spring-dampers (multi-turn), bushings; then performance (sparse Jacobian, analytic
-  iteration matrix) once systems pass ~100 bodies.
+- Performance: sparse / structured constraint Jacobian, analytic iteration
+  matrix, scaling benchmarks past ~100 bodies.

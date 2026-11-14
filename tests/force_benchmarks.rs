@@ -507,3 +507,261 @@ fn force_elements_validate_and_round_trip() {
         codes::DEGENERATE_FORCE
     );
 }
+
+// ── joint springs and bushings (M3 card 2) ──────────────────────────────
+
+fn joint_spring(sys: &mut System, slot: DriverSlot, k: f64, c: f64, free_value: f64) {
+    add(
+        sys,
+        ForceElement::JointSpringDamper {
+            id: ForceId(10),
+            name: "joint spring".into(),
+            joint: JointId(1),
+            slot,
+            stiffness: k,
+            damping: c,
+            free_value,
+            preload: 0.0,
+        },
+    );
+}
+
+/// A torsion spring-damper on the hinge (ζ = 0.05): the damped torsional
+/// pendulum `θ₀·e^(−ζωt)·(cos ω_d·t + ζω/ω_d·sin ω_d·t)`, `ω = √(k/I_o)`.
+#[test]
+fn joint_torsion_spring_damper() {
+    let (k, zeta, theta0) = (3.0, 0.05, 0.4);
+    let c = 2.0 * zeta * (k * i_hinge()).sqrt();
+    let mut sys = pendulum(theta0, false);
+    joint_spring(&mut sys, DriverSlot::Rotation, k, c, 0.0);
+    let omega = (k / i_hinge()).sqrt();
+    let wd = omega * (1.0 - zeta * zeta).sqrt();
+    let sim = simulate(
+        &sys,
+        &grid(4.0, 0.01),
+        &HhtSettings::fixed(DEFAULT_ALPHA, 1e-3),
+    )
+    .unwrap();
+    let worst = sim
+        .frames
+        .iter()
+        .map(|f| {
+            let t = f.time;
+            let exact = theta0
+                * (-zeta * omega * t).exp()
+                * ((wd * t).cos() + zeta * omega / wd * (wd * t).sin());
+            (f.state.joint_angle(JointId(1)).unwrap() - exact).abs()
+        })
+        .fold(0.0, f64::max);
+    assert!(
+        worst < 1e-5 * theta0,
+        "damped torsional pendulum error {worst:e}"
+    );
+}
+
+/// A torsion spring wound past several turns: statically, a torque
+/// `k·(6π + 0.5)` holds the hinge at 6π + 0.5 rad (the angle is tracked
+/// across turns); dynamically, a spin-up of `ω₀` winds it to
+/// `ω₀·√(I_o/k)` = 2.5 turns with the energy (spring potential included)
+/// conserved.
+#[test]
+fn joint_spring_winds_several_turns() {
+    let k = 2.0;
+    let target = 6.0 * std::f64::consts::PI + 0.5;
+    let mut held = pendulum(0.0, false);
+    joint_spring(&mut held, DriverSlot::Rotation, k, 0.0, 0.0);
+    add(
+        &mut held,
+        ForceElement::AppliedTorque {
+            id: ForceId(1),
+            name: "wind".into(),
+            marker: MarkerId(2),
+            torque: DVec3::Z * k * target,
+        },
+    );
+    let eq = static_equilibrium(&held, 0.0, None).unwrap();
+    close(
+        eq.state.joint_angle(JointId(1)).unwrap(),
+        target,
+        1e-10,
+        "wound static angle",
+    );
+
+    let turns = 2.5;
+    let mut spun = pendulum(0.0, false);
+    joint_spring(&mut spun, DriverSlot::Rotation, k, 0.0, 0.0);
+    let omega0 = turns * std::f64::consts::TAU * (k / i_hinge()).sqrt();
+    spun.bodies.get_mut(&BodyId(2)).unwrap().angular_velocity = DVec3::Z * omega0;
+    let sim = simulate(
+        &spun,
+        &grid(2.0, 0.002),
+        &HhtSettings::fixed(DEFAULT_ALPHA, 5e-4),
+    )
+    .unwrap();
+    let peak = sim
+        .frames
+        .iter()
+        .map(|f| f.state.joint_angle(JointId(1)).unwrap())
+        .fold(f64::MIN, f64::max);
+    close(
+        peak,
+        turns * std::f64::consts::TAU,
+        1e-5,
+        "winding amplitude",
+    );
+    let e0 = energy(&spun, &sim.frames[0].state, &sim.frames[0].velocity)
+        .unwrap()
+        .total();
+    for f in &sim.frames {
+        let e = energy(&spun, &f.state, &f.velocity).unwrap().total();
+        assert!(
+            (e - e0).abs() < 1e-5 * e0,
+            "energy at t = {}: {e} vs {e0}",
+            f.time
+        );
+    }
+}
+
+/// A translational joint spring-damper on the slide equals the
+/// marker-to-marker spring-damper along it.
+#[test]
+fn prismatic_joint_spring_equals_line_spring() {
+    let mut a = slider(FREE + 0.04);
+    spring(&mut a, 1, 6.0, 0.0);
+    let mut b = slider(FREE + 0.04);
+    joint_spring(&mut b, DriverSlot::Translation, K, 6.0, FREE);
+    let times = grid(1.0, 0.01);
+    let sa = simulate(&a, &times, &HhtSettings::default()).unwrap();
+    let sb = simulate(&b, &times, &HhtSettings::default()).unwrap();
+    for (fa, fb) in sa.frames.iter().zip(&sb.frames) {
+        assert!((x_of(fa) - x_of(fb)).abs() < 1e-10, "t = {}", fa.time);
+    }
+}
+
+const KB: DVec3 = DVec3::new(1.0e4, 2.0e4, 3.0e4);
+const KT: DVec3 = DVec3::new(50.0, 60.0, 70.0);
+
+/// A part held only by a bushing to the ground (center of mass at the
+/// bushing's J marker).
+fn bushed(damping: f64, gravity: bool) -> System {
+    let mut sys = System::new("bushing");
+    if gravity {
+        sys.gravity = Some(DVec3::new(0.0, -G, 0.0));
+    }
+    sys.add_body(ground()).unwrap();
+    sys.add_body(part(DVec3::ZERO, DVec3::ZERO, DQuat::IDENTITY))
+        .unwrap();
+    marker(&mut sys, 1, 1, DVec3::ZERO, DQuat::IDENTITY);
+    marker(&mut sys, 2, 2, DVec3::ZERO, DQuat::IDENTITY);
+    add(
+        &mut sys,
+        ForceElement::Bushing {
+            id: ForceId(1),
+            name: "mount".into(),
+            marker1: MarkerId(1),
+            marker2: MarkerId(2),
+            stiffness: KB,
+            damping: DVec3::splat(damping),
+            torsion_stiffness: KT,
+            torsion_damping: DVec3::splat(damping * 1e-3),
+        },
+    );
+    sys
+}
+
+/// Static bushing deflection under the weight and a torque:
+/// `d_y = −m·g/k_y`, `θ_z = T/k_tz`, nothing else.
+#[test]
+fn bushing_static_deflection() {
+    let torque = 2.0;
+    let mut sys = bushed(0.0, true);
+    add(
+        &mut sys,
+        ForceElement::AppliedTorque {
+            id: ForceId(2),
+            name: "twist".into(),
+            marker: MarkerId(2),
+            torque: DVec3::Z * torque,
+        },
+    );
+    let eq = static_equilibrium(&sys, 0.0, None).unwrap();
+    let (t, r) = eq.state.body_pose(BodyId(2)).unwrap();
+    assert!(
+        (t - DVec3::new(0.0, -M * G / KB.y, 0.0)).length() < 1e-12,
+        "{t:?}"
+    );
+    let theta = r.to_scaled_axis();
+    assert!(
+        (theta - DVec3::Z * torque / KT.z).length() < 1e-12,
+        "{theta:?}"
+    );
+}
+
+/// Bushing vibration: translation at `√(k_x/m)`, torsion at `√(k_tz/I_zz)`,
+/// and the undamped energy (bushing potential included) conserved.
+#[test]
+fn bushing_vibration_and_energy() {
+    let (v0, w0) = (0.05, 0.2);
+    let mut sys = bushed(0.0, false);
+    {
+        let b = sys.bodies.get_mut(&BodyId(2)).unwrap();
+        b.velocity = DVec3::new(v0, 0.0, 0.0);
+        b.angular_velocity = DVec3::Z * w0;
+    }
+    let (wx, wz) = ((KB.x / M).sqrt(), (KT.z / IZZ).sqrt());
+    let sim = simulate(&sys, &grid(0.5, 0.001), &HhtSettings::fixed(0.0, 1e-4)).unwrap();
+    let e0 = energy(&sys, &sim.frames[0].state, &sim.frames[0].velocity)
+        .unwrap()
+        .total();
+    let (mut worst_x, mut worst_r, mut worst_e) = (0.0_f64, 0.0_f64, 0.0_f64);
+    for f in &sim.frames {
+        let t = f.time;
+        let (p, r) = f.state.body_pose(BodyId(2)).unwrap();
+        worst_x = worst_x.max((p.x - v0 / wx * (wx * t).sin()).abs());
+        worst_r = worst_r.max((r.to_scaled_axis().z - w0 / wz * (wz * t).sin()).abs());
+        let e = energy(&sys, &f.state, &f.velocity).unwrap().total();
+        worst_e = worst_e.max((e - e0).abs() / e0);
+    }
+    eprintln!("bushing: x {worst_x:.2e}, θz {worst_r:.2e}, energy {worst_e:.2e}");
+    assert!(worst_x < 1e-3 * v0 / wx, "translation error {worst_x:e}");
+    assert!(worst_r < 1e-3 * w0 / wz, "torsion error {worst_r:e}");
+    assert!(worst_e < 1e-6, "energy drift {worst_e:e}");
+}
+
+/// Joint springs and bushings validate and serialize.
+#[test]
+fn joint_spring_and_bushing_validate() {
+    let mut sys = bushed(5.0, true);
+    sys.add_body(Body {
+        id: BodyId(3),
+        ..part(DVec3::ZERO, DVec3::new(1.0, 0.0, 0.0), DQuat::IDENTITY)
+    })
+    .unwrap();
+    marker(&mut sys, 3, 1, DVec3::new(1.0, 0.0, 0.0), DQuat::IDENTITY);
+    marker(&mut sys, 4, 3, DVec3::ZERO, DQuat::IDENTITY);
+    sys.add_joint(Joint {
+        id: JointId(1),
+        name: "hinge".into(),
+        kind: JointKind::Revolute,
+        marker1: MarkerId(3),
+        marker2: MarkerId(4),
+        suppressed: false,
+    })
+    .unwrap();
+    joint_spring(&mut sys, DriverSlot::Rotation, 1.0, 0.1, 0.2);
+    assert!(sys.validate().is_ok());
+    let text = serde_json::to_string(&sys).unwrap();
+    assert_eq!(serde_json::from_str::<System>(&text).unwrap(), sys);
+    let mut wrong = sys.clone();
+    if let Some(ForceElement::JointSpringDamper { slot, .. }) = wrong.forces.get_mut(&ForceId(10)) {
+        *slot = DriverSlot::Translation;
+    }
+    assert_eq!(wrong.validate().unwrap_err().code, codes::SLOT_UNSUPPORTED);
+    let mut dangling = sys.clone();
+    if let Some(ForceElement::JointSpringDamper { joint, .. }) =
+        dangling.forces.get_mut(&ForceId(10))
+    {
+        *joint = JointId(7);
+    }
+    assert_eq!(dangling.validate().unwrap_err().code, codes::DANGLING_JOINT);
+}
