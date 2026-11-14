@@ -10,7 +10,31 @@
   validation gates; serde golden round-trip tests.
 - Dependency on `rcad-gcs` declared for the M1 position-level solver.
 
-## Unreleased (M1 + M1.5 + M2 + M3 + M4 complete, performance channel)
+## Unreleased (M1 + M1.5 + M2 + M3 + M4 complete, performance channel, Tier C)
+
+### Tier C — MuJoCo cross-check
+
+- `mjcf` module: `write_mjcf(sys, &MjcfOptions)` — tree mechanisms
+  (hinge / slide / ball / hinge+slide / nested welds, free bodies as
+  freejoints with their initial velocity in a keyframe), revolute /
+  spherical loop closures as `connect` equalities, gravity, spring-dampers
+  as spatial tendons, joint spring-dampers as joint stiffness / damping /
+  springref; contacts off, energy on. New code `mjcf_unsupported`.
+- `tests/tier_c/`: five cases (double pendulum, spatial ball+hinge chain,
+  free tumbler about its intermediate axis, sprung cart-pendulum with a
+  tendon spring, four-bar closed by a connect equality), the MuJoCo runner
+  (`run_mujoco.py`, Python via uv), committed references from MuJoCo 4.0.1
+  (RK4, 0.1 ms); `tests/tier_c.rs`: worst ≤ 2.5e-6 m, ≤ 8.9e-5 rad (the
+  slender spatial link about its own axis), energy ≤ 1.4e-6 J, the
+  remaining difference being this crate's integration error at a 1e-10
+  tolerance (MuJoCo's RK4 holds energy to 1e-14).
+- Fix found on the way: the Newton targets now follow the error tolerance
+  (velocity corrections below `1e-4·tol/h`, constraint residuals below
+  `1e-2·tol`, never below the index-3 rounding floor, accepted when
+  stalled there). The fixed 1e-9 target let corrector error accumulate
+  over the many steps of a tight tolerance: at 1e-10 the double
+  pendulum's energy drift falls 3.2e-6 → 2.5e-7 J, the tumbler's 3.1e-7 →
+  4.8e-8 J. Default-tolerance runs are unchanged (same steps).
 
 ### M4 card 2 — integrator's guide and sample adapter (M4 complete)
 
@@ -330,5 +354,5 @@ the linear solver).
 
 ### Next
 
-- Tier C: cross-check against MuJoCo (Python via uv): the same models
-  exported, trajectories and energy compared at tolerance level.
+- Open: M5 (friction, contact) as its own card; Project Chrono as a second
+  Tier C engine if wanted.

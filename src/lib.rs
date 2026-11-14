@@ -40,6 +40,7 @@ pub mod joint;
 pub mod kinematics;
 pub mod measure;
 pub mod merge;
+pub mod mjcf;
 pub mod reaction;
 pub mod study;
 mod linalg;
@@ -66,6 +67,7 @@ pub use kinematics::{
 };
 pub use measure::{JointMotion, MarkerMotion, PointMotion, RelativeMotion};
 pub use merge::{merge_fixed_groups, MergedSystem, Placement};
+pub use mjcf::{write_mjcf, MjcfOptions};
 pub use reaction::{reactions, Reaction};
 pub use study::{
     run_study, Analysis, BodyResult, Integrator, MeasureRequest, MeasureValue, ReactionResult, ResultFrame, Study,

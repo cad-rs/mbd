@@ -71,6 +71,14 @@ use crate::system::System;
 /// The Adams default HHT α.
 pub const DEFAULT_ALPHA: f64 = -0.3;
 
+/// Position-constraint tolerance of a converged step (m / rad), and its
+/// fraction of the error tolerance under error control.
+const CONSTRAINT_TOL_FRACTION: f64 = 1.0e-2;
+
+/// Under error control the velocity correction must fall below this
+/// fraction of `tol / h`.
+const NEWTON_TOL_FRACTION: f64 = 1.0e-4;
+
 /// Position-constraint tolerance of a converged step (m / rad).
 const CONSTRAINT_TOL: f64 = 1.0e-10;
 
@@ -107,7 +115,10 @@ pub struct HhtSettings {
     /// The estimate is the Newmark local error on the true accelerations
     /// `(β − ⅙)·h²·(q̈ₙ₊₁ − q̈ₙ)` (Zienkiewicz–Xie; the auxiliary `a` carries
     /// the damped constraint-force oscillation of index 3 and would make a
-    /// noisy estimate).
+    /// noisy estimate). The Newton targets follow it (velocity corrections
+    /// below `1e-4·tol/h`, constraint residuals below `1e-2·tol`). Useful
+    /// down to about 1e-10: below that, index-3 rounding (`ε/h` in the
+    /// velocities, `ε/h²` in the accelerations) dominates the estimate.
     pub error_tol: Option<f64>,
     /// Step bounds (s) for the controller and for Newton-failure halving.
     pub min_step: f64,
@@ -457,6 +468,54 @@ impl Factor {
     }
 }
 
+/// A step's Newton convergence targets. With error control they follow the
+/// tolerance (the corrector error must stay well below the local
+/// integration error, or it accumulates over the steps), never below the
+/// rounding floor: index 3 turns ~ε of position rounding into ~ε/h of
+/// velocity.
+struct NewtonTargets {
+    /// Velocity-correction target relative part (`newton_tol`) and the
+    /// absolute cap from the error tolerance (`1e-4·tol/h`).
+    relative: f64,
+    cap: f64,
+    /// The rounding floor of a velocity correction.
+    velocity_floor: f64,
+    /// Position-constraint residual target.
+    constraint: f64,
+}
+
+impl NewtonTargets {
+    fn new(settings: &HhtSettings, from: &Point, h: f64) -> Self {
+        let position_scale = from
+            .state
+            .params
+            .iter()
+            .fold(0.0_f64, |s, v| s.max(v.abs()));
+        let eps = f64::EPSILON;
+        let velocity_floor = 64.0 * eps * (1.0 + position_scale) / h;
+        let constraint_floor = 64.0 * eps * (1.0 + position_scale);
+        let (cap, constraint) = match settings.error_tol {
+            Some(tol) => (
+                NEWTON_TOL_FRACTION * tol / h,
+                CONSTRAINT_TOL.min(CONSTRAINT_TOL_FRACTION * tol),
+            ),
+            None => (f64::INFINITY, CONSTRAINT_TOL),
+        };
+        Self {
+            relative: settings.newton_tol,
+            cap,
+            velocity_floor,
+            constraint: constraint.max(constraint_floor),
+        }
+    }
+
+    fn velocity(&self, speed: f64) -> f64 {
+        (self.relative * (1.0 + speed))
+            .min(self.cap)
+            .max(self.velocity_floor)
+    }
+}
+
 /// Attempt one step; `None` when Newton does not converge.
 fn take_step(
     problem: &Problem,
@@ -490,6 +549,8 @@ fn take_step(
         fresh = true;
     }
     let mut stale = 0;
+    let tolerances = NewtonTargets::new(settings, from, h);
+    let mut previous = f64::INFINITY;
     for _ in 0..settings.max_newton {
         let ev = step.eval(&a, &lambda)?;
         let rhs: Vec<f64> = ev.r.iter().map(|v| -v).collect();
@@ -506,9 +567,15 @@ fn take_step(
             *li += d;
         }
         let correction = step.gamma * (1.0 + alpha) * h * inf_norm(&dx[..n]);
-        if correction <= settings.newton_tol * (1.0 + inf_norm(&ev.v)) && ev.phi <= CONSTRAINT_TOL {
+        let target = tolerances.velocity(inf_norm(&ev.v));
+        // Converged — or stalled at the rounding floor (index 3 carries
+        // position rounding into the velocities as ~ε/h).
+        let stalled =
+            correction >= 0.5 * previous && correction <= 16.0 * tolerances.velocity_floor;
+        previous = correction;
+        if (correction <= target || stalled) && ev.phi <= tolerances.constraint {
             let fin = step.eval(&a, &lambda)?;
-            if fin.phi > 10.0 * CONSTRAINT_TOL {
+            if fin.phi > 10.0 * tolerances.constraint {
                 return Ok(None);
             }
             let mut state = from.state.clone();

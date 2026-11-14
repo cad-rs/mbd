@@ -289,7 +289,7 @@ src/
 |---|---|---|
 | **A Analytic closed form** | mathematical truth | free fall a=g; small-angle pendulum period 2π√(l/g) + energy conservation; spring-mass ω=√(k/m); damped oscillation three-regime closed form; crank-slider x=r·cosθ+√(l²−r²sin²θ); four-bar Freudenstein; gear ratio and torque balance ω₁T₁=ω₂T₂; **long-run angular-momentum drift with no external force** (integrator quality metric) |
 | **B OndselSolver reference poses + reactions** | `.asmt` samples → independent exe → reference JSON | position/velocity/acceleration levels (all three complete) + joint/motion reaction series (inverse dynamics, with gravity; M2). The gap doc Phase 5 methodology; OndselSolver is local |
-| **C Open-source MBD cross-check** | Project Chrono / MuJoCo (Python bindings via uv) | tolerance-level sanity (different integrator/contact paths); cross-check only, no alignment. Introduced from M2 |
+| **C Open-source MBD cross-check** | MuJoCo (Python via uv; `write_mjcf` export, `tests/tier_c/`) — Project Chrono optional later | tolerance-level sanity (minimal coordinates, RK4; soft loop equalities); cross-check only, no alignment |
 
 Plus: crate-level golden (system serialization bytes stable) and
 determinism tests (same input → same trajectory).

@@ -85,4 +85,6 @@ pub mod codes {
     /// A study is unusable (an empty or non-finite output grid, a measure
     /// on an entity the system does not have).
     pub const BAD_STUDY: &str = "bad_study";
+    /// The system uses something the MJCF export does not cover.
+    pub const MJCF_UNSUPPORTED: &str = "mjcf_unsupported";
 }

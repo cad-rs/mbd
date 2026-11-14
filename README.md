@@ -15,6 +15,7 @@ the consumer's code.
 | M2 | Forward dynamics, index-3 HHT-α with error control, static equilibrium, joint reactions | **done** (Tier A closed forms, momentum audit; Tier B reactions vs OndselSolver ≤ 1.4e-10 N) |
 | M3 | Force library: function forces (time / state curves), follower loads, line forces, preloaded springs, joint spring-dampers, bushings, work audit | **done** |
 | perf | Sparse per-step work: owner-local Jacobian, coloured differences, sparse LDLᵀ | **done** (100-body chain ≈ 2.3 s per simulated second) |
+| Tier C | MuJoCo cross-check via the MJCF export (5 cases, ≤ 2.5e-6 m) | **done** |
 | M4 | Kernel-neutral integration surface: study API, result tables (serde + CSV), integrator's guide ([`docs/INTEGRATING.md`](docs/INTEGRATING.md)) + sample adapter | **done** |
 
 ## How it models
