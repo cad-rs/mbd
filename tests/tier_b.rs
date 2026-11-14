@@ -39,7 +39,6 @@ fn load(name: &str) -> Reference {
 
 /// Pose, velocity and acceleration of every part at every reference time.
 #[test]
-#[ignore = "needs the OndselSolver references tests/tier_b/*.json (tests/tier_b/README.md)"]
 fn tier_b_matches_ondsel() {
     for case in cases::all() {
         let reference = load(case.name);
@@ -74,7 +73,9 @@ fn tier_b_matches_ondsel() {
             case.name,
             shown.join(" ")
         );
-        let limits = [1e-8, 1e-8, 1e-7, 1e-7, 1e-5, 1e-5];
+        // Observed (OndselSolver 09d6175, release): worst 3.8e-10 (spatial_rsur
+        // alpha), everything else <= 5e-11; the limits keep >= 25x headroom.
+        let limits = [1e-10, 1e-9, 1e-9, 1e-9, 1e-8, 1e-8];
         for ((w, limit), what) in worst.iter().zip(limits).zip([
             "position",
             "rotation",

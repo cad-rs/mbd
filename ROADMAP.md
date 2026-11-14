@@ -87,7 +87,7 @@ equations only at the position level; the tangent-space levels have none.
 (BTreeMap stable order) + serde + golden. Gates: golden bytes stable +
 `cargo test -p rcad-mbd`.
 
-### M1 Kinematic three levels (= the full OndselSolver tier, the real body of closed-loop Tier 1) — **Tier A done, Tier B open**
+### M1 Kinematic three levels (= the full OndselSolver tier, the real body of closed-loop Tier 1) — **done**
 - Position-level IC: the joint residuals (own formulation, every row a dot
   product) on the `rcad-gcs` damped Newton core; seedable
   (`position_ic_from`) so a sweep stays on one assembly branch; rotation
@@ -118,10 +118,13 @@ equations only at the position level; the tangent-space levels have none.
   OndselSolver `.asmt` reference-pose comparison (Tier B, reusing the gap
   doc Phase 5 methodology — the `.asmt` text format is dependency-free;
   the samples are exported from the test systems by `write_asmt`, an
-  independent OndselSolver exe produces the reference JSON): **pipeline
-  ready** (`src/asmt.rs`, `examples/tier_b.rs`, `tests/tier_b/` — offset
-  crank-slider, spatial RSUR, nested cylindrical/fixed/prismatic chain);
-  **references pending** an OndselSolver build.
+  independent OndselSolver exe produces the reference JSON): **green**
+  (`src/asmt.rs`, `examples/tier_b.rs`, `tests/tier_b/` — offset
+  crank-slider, spatial RSUR, nested cylindrical/fixed/prismatic chain;
+  position/orientation/velocity/acceleration of every part at 101 instants
+  agree to ≤ 4e-10 with OndselSolver `09d6175`).
+
+**M1 is complete.**
 
 ### M1.5 CAD-grade kinematics (proposed, pending review)
 What the commercial CAD motion tools have at the kinematic level that the

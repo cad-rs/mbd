@@ -15,7 +15,12 @@
 //!   direction-cosine sets this crate uses;
 //! - drivers become `RotationalMotion` / `TranslationalMotion` on their joint
 //!   with a `time` expression (constant-rate and harmonic profiles; the
-//!   sampled profiles have no expression and are refused).
+//!   sampled profiles have no expression and are refused). A joint driven
+//!   in both rotation and translation gives the rotation motion its own
+//!   alias I marker (see the comment in [`write_asmt`]).
+//!
+//! Verified against an OndselSolver build (Tier B, `tests/tier_b.rs`): the
+//! exported cases agree with this crate's kinematics to ≤ 4e-10.
 //!
 //! Export only, kinematic subset: no force elements, no gravity.
 
@@ -57,6 +62,25 @@ pub fn write_asmt(sys: &System, sim: &AsmtSimulation) -> Result<String, MbdError
             "force elements and gravity are not exported (kinematic subset)",
         ));
     }
+    // OndselSolver realizes a motion by turning its I marker into a
+    // time-dependent frame; two motions on one joint share that marker and
+    // the later one overwrites the earlier one's prescription (observed: a
+    // cylindrical joint with both drivers did not rotate). The rotation
+    // driver of a doubly-driven joint therefore gets its own I marker, an
+    // alias of marker 1 at the same pose, and names its markers explicitly.
+    let aliased: Vec<usize> = sys
+        .drivers
+        .iter()
+        .enumerate()
+        .filter(|(_, d)| {
+            d.slot == DriverSlot::Rotation
+                && sys
+                    .drivers
+                    .iter()
+                    .any(|o| o.joint == d.joint && o.slot == DriverSlot::Translation)
+        })
+        .map(|(i, _)| i)
+        .collect();
     let mut out = String::new();
     let w = &mut out;
     line(w, 0, "OndselSolver");
@@ -117,6 +141,19 @@ pub fn write_asmt(sys: &System, sim: &AsmtSimulation) -> Result<String, MbdError
                     marker.rotation,
                 )],
             );
+            for &index in &aliased {
+                if sys.joints[&sys.drivers[index].joint].marker1 == marker.id {
+                    ref_point(
+                        w,
+                        4,
+                        &[(
+                            alias_name(marker.id, index),
+                            marker.translation,
+                            marker.rotation,
+                        )],
+                    );
+                }
+            }
         }
         line(w, 3, "RefCurves");
         line(w, 3, "RefSurfaces");
@@ -156,8 +193,18 @@ pub fn write_asmt(sys: &System, sim: &AsmtSimulation) -> Result<String, MbdError
         line(w, 3, keyword);
         line(w, 4, "Name");
         line(w, 5, &format!("d{index}"));
-        line(w, 4, "MotionJoint");
-        line(w, 5, &format!("/{ASSEMBLY}/j{}", joint.id.0));
+        if aliased.contains(&index) {
+            // Own I frame (an alias of marker 1), no motion joint.
+            line(w, 4, "MarkerI");
+            line(w, 5, &alias_path(sys, joint.marker1, index));
+            line(w, 4, "MarkerJ");
+            line(w, 5, &marker_path(sys, joint.marker2));
+            line(w, 4, "MotionJoint");
+            line(w, 5, "");
+        } else {
+            line(w, 4, "MotionJoint");
+            line(w, 5, &format!("/{ASSEMBLY}/j{}", joint.id.0));
+        }
         line(w, 4, slot);
         line(w, 5, &expr);
     }
@@ -217,6 +264,19 @@ fn joint_keyword(kind: JointKind) -> &'static str {
 fn marker_path(sys: &System, marker: crate::body::MarkerId) -> String {
     let body = &sys.bodies[&sys.markers[&marker].body];
     format!("/{ASSEMBLY}/{}/m{}", part_name(body), marker.0)
+}
+
+fn alias_name(marker: crate::body::MarkerId, driver: usize) -> String {
+    format!("m{}d{driver}", marker.0)
+}
+
+fn alias_path(sys: &System, marker: crate::body::MarkerId, driver: usize) -> String {
+    let body = &sys.bodies[&sys.markers[&marker].body];
+    format!(
+        "/{ASSEMBLY}/{}/{}",
+        part_name(body),
+        alias_name(marker, driver)
+    )
 }
 
 /// The driver profile as an OndselSolver `time` expression.
@@ -423,6 +483,43 @@ mod tests {
         assert!(text.contains("\t\t\t\tRotationZ\n\t\t\t\t\t0.25 - 2*time\n"));
         assert!(text.contains("\t\tnframe\n\t\t\t11\n"));
         assert_eq!(text, write_asmt(&hinge(), &sim).unwrap(), "deterministic");
+    }
+
+    /// A joint driven in rotation and translation gives the rotation motion
+    /// its own alias I marker (OndselSolver lets the later motion on a shared
+    /// I marker overwrite the earlier one); the translation keeps the joint.
+    #[test]
+    fn doubly_driven_joint_aliases_the_rotation_marker() {
+        let sim = AsmtSimulation {
+            tstart: 0.0,
+            tend: 1.0,
+            hout: 0.1,
+        };
+        let mut sys = hinge();
+        sys.joints.get_mut(&JointId(1)).unwrap().kind = JointKind::Cylindrical;
+        sys.add_driver(Driver {
+            joint: JointId(1),
+            slot: DriverSlot::Translation,
+            profile: DriverProfile::Constant {
+                start: 0.0,
+                rate: 0.5,
+            },
+        });
+        let text = write_asmt(&sys, &sim).unwrap();
+        assert!(
+            text.contains("\t\t\t\t\t\t\t\tm1d0\n"),
+            "alias marker on the ground part"
+        );
+        assert!(text.contains(
+            "\t\t\tRotationalMotion\n\t\t\t\tName\n\t\t\t\t\td0\n\t\t\t\tMarkerI\n\t\t\t\t\t/Assembly/b1/m1d0\n\t\t\t\tMarkerJ\n\t\t\t\t\t/Assembly/b2/m2\n\t\t\t\tMotionJoint\n\t\t\t\t\t\n"
+        ));
+        assert!(text.contains(
+            "\t\t\tTranslationalMotion\n\t\t\t\tName\n\t\t\t\t\td1\n\t\t\t\tMotionJoint\n\t\t\t\t\t/Assembly/j1\n"
+        ));
+        assert!(
+            !write_asmt(&hinge(), &sim).unwrap().contains("m1d0"),
+            "single driver: no alias"
+        );
     }
 
     /// Profiles without an expression and non-diagonal inertia are refused.

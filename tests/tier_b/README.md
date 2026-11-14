@@ -32,8 +32,22 @@ systems (`cases.rs`). The references are the committed `<case>.json` files;
    cargo run --example tier_b -- reference <dir> "OndselSolver <commit>"
    ```
 
-4. `cargo test --test tier_b -- --include-ignored` (drop the `#[ignore]` on
-   `tier_b_matches_ondsel` once the JSON files are committed).
+4. `cargo test --test tier_b -- --nocapture` prints the worst deviation per
+   case; tighten or justify the limits in `tests/tier_b.rs` accordingly.
+
+The committed references come from OndselSolver `09d6175` (2025-01-21),
+release build. Worst deviation from this crate: 3.8e-10 (spatial RSUR
+angular acceleration); everything else ≤ 5e-11.
+
+## OndselSolver quirks met on the way
+
+- `ASMTAssembly::assemblyFromFile` pops the `Assembly` header inside an
+  `assert()`, so a release (NDEBUG) build parses one line off and crashes —
+  the runner reads the file itself.
+- A motion turns its I marker into a time-dependent frame; two motions on
+  one joint (cylindrical: rotation + translation) share it and the later
+  one overwrites the earlier — the export gives the rotation motion its own
+  alias I marker.
 
 ## What is compared
 

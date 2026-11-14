@@ -10,7 +10,19 @@
   validation gates; serde golden round-trip tests.
 - Dependency on `rcad-gcs` declared for the M1 position-level solver.
 
-## Unreleased (M1)
+## Unreleased (M1 complete)
+
+### Tier B references — green
+
+- `tests/tier_b/*.json`: reference trajectories from OndselSolver
+  `09d6175` (release build) for the three cases; `tier_b_matches_ondsel`
+  is live. Worst deviation 3.8e-10 (spatial RSUR angular acceleration),
+  everything else ≤ 5e-11; limits keep ≥ 25× headroom.
+- `write_asmt`: the rotation motion of a joint driven in both rotation and
+  translation gets its own alias I marker — OndselSolver lets two motions
+  sharing an I marker overwrite each other.
+- Reference runner: reads the `.asmt` itself (`assemblyFromFile` pops the
+  header inside an `assert()`, which a release build drops).
 
 ### Tier B pipeline
 

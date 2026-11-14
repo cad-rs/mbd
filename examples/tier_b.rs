@@ -55,7 +55,7 @@ fn reference(dir: &Path, source: &str) -> Result<(), String> {
             std::fs::read_to_string(&path).map_err(|e| format!("{}: {e}", path.display()))?;
         let reference =
             parse_time_series(&text, source).map_err(|e| format!("{}: {e}", path.display()))?;
-        let json = serde_json::to_string_pretty(&reference).map_err(|e| e.to_string())?;
+        let json = serde_json::to_string(&reference).map_err(|e| e.to_string())?;
         let target = out_dir.join(format!("{}.json", case.name));
         std::fs::write(&target, json + "\n").map_err(|e| e.to_string())?;
         println!(
