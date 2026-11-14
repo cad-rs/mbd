@@ -1,0 +1,39 @@
+[package]
+name = "rcad-mbd"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Standalone multibody-dynamics backend: rigid bodies, joints, drivers and force elements, kinematic solving and forward dynamics with joint reactions"
+readme = "README.md"
+repository = "https://github.com/cad-rs/mbd"
+homepage = "https://github.com/cad-rs/mbd"
+documentation = "https://docs.rs/rcad-mbd"
+keywords = ["multibody-dynamics", "kinematics", "simulation", "rigid-body", "cad"]
+categories = ["mathematics", "science"]
+# Library crate: ship the sources, the test corpus and the license texts.
+include = [
+    "src/**/*",
+    "tests/**/*",
+    "README.md",
+    "ROADMAP.md",
+    "CHANGELOG.md",
+    "LICENSE",
+    "LICENSE-MIT",
+    "LICENSE-APACHE",
+]
+
+[dependencies]
+glam = { version = "0.29", features = ["serde"] }
+serde = { version = "1.0", features = ["derive"] }
+thiserror = "2.0"
+# Position-level initial-condition solving (M1) reuses the standalone
+# geometric constraint solver's rigid-pose family.
+rcad-gcs = { git = "https://github.com/cad-rs/gcs", tag = "v0.1.0" }
+
+[dev-dependencies]
+serde_json = "1.0"
+
+# This crate is the workspace root: the empty table keeps `cargo` from
+# walking up into a parent workspace when it is vendored or checked out
+# inside another tree.
+[workspace]
