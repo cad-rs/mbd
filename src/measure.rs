@@ -18,7 +18,7 @@ use crate::kinematics::{coordinate_motion, KinematicFrame, Twist};
 use crate::system::System;
 
 /// A point's world position and its first two time derivatives.
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct PointMotion {
     pub position: DVec3,
     pub velocity: DVec3,
@@ -27,7 +27,7 @@ pub struct PointMotion {
 
 /// A marker's world frame and its rates: the origin's velocity /
 /// acceleration with the carrying body's angular velocity / acceleration.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct MarkerMotion {
     pub position: DVec3,
     pub rotation: DQuat,
@@ -39,7 +39,7 @@ pub struct MarkerMotion {
 /// acceleration — world-frame differences expressed in I's axes), the
 /// relative angular velocity / acceleration (world differences expressed in
 /// I's axes) and the relative rotation `R_I⁻¹·R_J`.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct RelativeMotion {
     pub displacement: DVec3,
     pub velocity: DVec3,
@@ -51,7 +51,7 @@ pub struct RelativeMotion {
 
 /// A joint coordinate (the slot a driver or coupler addresses) and its
 /// first two time derivatives; rotation values are unwrapped across turns.
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct JointMotion {
     pub value: f64,
     pub velocity: f64,

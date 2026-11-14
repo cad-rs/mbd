@@ -82,4 +82,7 @@ pub mod codes {
     /// A force element's numbers are unusable (non-finite parameters, a
     /// zero direction, an invalid curve).
     pub const BAD_FORCE_ELEMENT: &str = "bad_force_element";
+    /// A study is unusable (an empty or non-finite output grid, a measure
+    /// on an entity the system does not have).
+    pub const BAD_STUDY: &str = "bad_study";
 }

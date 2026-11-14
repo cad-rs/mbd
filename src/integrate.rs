@@ -149,7 +149,7 @@ impl HhtSettings {
 }
 
 /// Integrator work counters.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct IntegrationStats {
     /// Accepted steps.
     pub steps: usize,

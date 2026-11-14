@@ -41,6 +41,7 @@ pub mod kinematics;
 pub mod measure;
 pub mod merge;
 pub mod reaction;
+pub mod study;
 mod linalg;
 mod sparse;
 pub mod system;
@@ -66,6 +67,10 @@ pub use kinematics::{
 pub use measure::{JointMotion, MarkerMotion, PointMotion, RelativeMotion};
 pub use merge::{merge_fixed_groups, MergedSystem, Placement};
 pub use reaction::{reactions, Reaction};
+pub use study::{
+    run_study, Analysis, BodyResult, Integrator, MeasureRequest, MeasureValue, ReactionResult, ResultFrame, Study,
+    StudyResult, TimeGrid,
+};
 pub use system::{System, STANDARD_GRAVITY};
 
 #[cfg(test)]

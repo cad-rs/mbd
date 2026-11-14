@@ -226,7 +226,7 @@ fn coordinate_jet(
 
 /// A rigid-body velocity (or acceleration): the linear rate of the body
 /// frame origin and the angular rate, both in the world frame.
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct Twist {
     pub linear: DVec3,
     pub angular: DVec3,
@@ -241,7 +241,8 @@ impl Twist {
 }
 
 /// Which entity owns a constraint equation.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum EquationOwner {
     Joint(JointId),
     Coupler(CouplerId),
@@ -251,7 +252,7 @@ pub enum EquationOwner {
 
 /// One constraint equation: its owner and the row within the owner (joint
 /// rows follow the formulation order of the joint kind; a driver has one).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize)]
 pub struct EquationRef {
     pub owner: EquationOwner,
     pub row: usize,

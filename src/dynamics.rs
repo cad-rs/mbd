@@ -194,7 +194,7 @@ pub struct StaticEquilibrium {
 
 /// Energy audit of a state: kinetic, gravitational and elastic (spring)
 /// potential. Potentials are zero at the world origin / free length.
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct Energy {
     pub kinetic: f64,
     pub gravity: f64,
@@ -209,7 +209,7 @@ impl Energy {
 
 /// Momentum audit: total linear momentum and angular momentum about the
 /// world origin.
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Default, serde::Serialize, serde::Deserialize)]
 pub struct Momentum {
     pub linear: DVec3,
     pub angular: DVec3,

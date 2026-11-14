@@ -10,7 +10,30 @@
   validation gates; serde golden round-trip tests.
 - Dependency on `rcad-gcs` declared for the M1 position-level solver.
 
-## Unreleased (M1 + M1.5 + M2 + M3 complete, performance channel)
+## Unreleased (M1 + M1.5 + M2 + M3 complete, performance channel, M4 in progress)
+
+### M4 card 1 — study API and result tables
+
+- `study` module: `Study { name, analysis, output, measures, reactions }`
+  as serde data — `Analysis::Kinematic` (sweep; with `reactions`, the
+  inverse-dynamics loads and motor efforts per frame), `Dynamic {
+  integrator }` (HHT-α; `Integrator` is the serializable face of
+  `HhtSettings`, every field defaulted), `Static` (quasi-static
+  equilibrium at every output time, seeded from the previous);
+  `TimeGrid::{Uniform, Times}`; `MeasureRequest::{Point, Marker, Relative,
+  JointCoordinate}` with labels. `run_study(sys, study)` → `StudyResult`
+  (per frame: body poses / velocities / accelerations, `ReactionResult`s
+  with effort and uniqueness, measure values, energy, momentum; redundant
+  equations; integrator stats). `StudyResult::to_csv`: one wide table.
+  New code `bad_study`.
+- serde on `Twist`, `EquationOwner`/`EquationRef`, the measure motions,
+  `Energy`, `Momentum`, `IntegrationStats`.
+- Tests (`tests/study.rs`): the study JSON form pinned as a contract and
+  round-tripped (sparse documents fill defaults); kinematic study efforts =
+  inverse dynamics; dynamic study ≡ `simulate`, JSON round trip of the
+  results, CSV shape and columns; quasi-static holding torque
+  `m·g·l·sin θ(t)`; refused studies. (`serde_json`'s `float_roundtrip`
+  feature for exact float round trips in the tests.)
 
 ### Performance — sparse dynamics and kinematics
 
