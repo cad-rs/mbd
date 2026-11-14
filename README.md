@@ -1,22 +1,27 @@
 # rcad-mbd — multibody dynamics
 
-A standalone multibody-dynamics backend usable outside of rcad: rigid bodies,
+A standalone, kernel-neutral multibody-dynamics library: rigid bodies,
 markers, joints, drivers and force elements in, state trajectories and joint
-reactions out. Pure math and data — no OCCT, no B-rep.
+reactions out. Pure math and data — no OCCT, no B-rep, no CAD-kernel
+dependency. Any CAD kernel or application can use it; the adapter from its
+own assembly model to a `System` (and the presentation of the results) is
+the consumer's code.
 
 | Milestone | What it is | State |
 |-----------|------------|-------|
 | M0 | Data model: `Body` / `Marker` / `Joint` / `Driver` / `ForceElement` / `System`, deterministic tables, `{code,detail,hint}` gates | **done** |
 | M1 | Kinematic three levels: position IC on the `rcad-gcs` Newton core, velocity and acceleration linear solves on the analytic Jacobian, redundancy diagnosis, smooth driver profiles, time sweep | **done** (Tier A closed forms + Tier B OndselSolver references, ≤ 4e-10) |
 | M1.5 | CAD-grade kinematics: joint primitives (mate vocabulary), gear / rack-pinion / screw couplers, rigid-group merging, measures | **done** |
-| M2 | Forward dynamics + BDF integration + joint-reaction recovery | planned |
-| M3 | Force library: gravity, spring-damper, torque, applied loads | planned |
-| M4 | Assembly wiring (Assembly → system conversion, tool surface) | planned |
+| M2 | Forward dynamics, index-3 HHT-α with error control, static equilibrium, joint reactions | **done** (Tier A closed forms, momentum audit; Tier B reactions vs OndselSolver ≤ 1.4e-10 N) |
+| M3 | Force library: function forces (time / state curves), follower loads, line forces, preloaded springs, joint spring-dampers, bushings, work audit | **done** |
+| perf | Sparse per-step work: owner-local Jacobian, coloured differences, sparse LDLᵀ | **done** (100-body chain ≈ 2.3 s per simulated second) |
+| M4 | Kernel-neutral integration surface: study API, result tables, integrator's guide + sample adapter | proposed |
 
 ## How it models
 
 - **Maximal coordinates**: every body carries 6 DOF; joints are constraint
-  equations (Lagrange multipliers from M2). Closed loops cost nothing.
+  equations with Lagrange multipliers (the joint reactions). Closed loops
+  cost nothing.
 - **SI units** inside the crate: kg, m, s, rad, N. Callers convert.
 - **Velocities in the world frame**: per body, the linear rate of the body
   frame origin and the angular rate (`Twist`).
@@ -36,6 +41,7 @@ sys.add_body(Body {
     id: BodyId(1), name: "base".into(),
     mass_kg: 0.0, com: DVec3::ZERO, inertia_com: DMat3::ZERO,
     translation: DVec3::ZERO, rotation: DQuat::IDENTITY, grounded: true,
+    velocity: DVec3::ZERO, angular_velocity: DVec3::ZERO,
 })?;
 // ... add the link body, hinge markers, revolute joint, driver ...
 sys.validate()?;
@@ -44,6 +50,11 @@ sys.validate()?;
 let times: Vec<f64> = (0..=100).map(|k| k as f64 * 0.01).collect();
 let frames = kinematic_sweep(&sys, &times)?;
 let link = frames[50].velocity[&BodyId(2)].angular; // world-frame ω
+
+// Dynamics (without the driver): index-3 HHT-α with error control;
+// every frame is consistent and carries the joint reactions.
+let sim = simulate(&sys, &times, &HhtSettings::default())?;
+let loads = sim.frames[50].reactions(&sys)?; // force / torque per joint
 ```
 
 Over-constrained layouts (a planar loop built from 3D joints) are normal:

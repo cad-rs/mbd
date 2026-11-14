@@ -1,7 +1,7 @@
 //! `rcad-mbd`: the multibody-dynamics backend (route card: `ROADMAP.md`).
 //!
 //! A standalone library in the `rcad-gcs` mould: pure math and data, no OCCT,
-//! no B-rep. Mass properties arrive as numbers (the kernel's GProp output,
+//! no B-rep. Mass properties arrive as numbers (any mass-property tool's output,
 //! converted to SI by the caller); the crate consumes rigid bodies, markers,
 //! joints, drivers and force elements and — from M1 on — produces state
 //! trajectories and joint reactions.
@@ -24,7 +24,8 @@
 //! dynamics (equations of motion, dynamic IC, static equilibrium), index-3
 //! HHT-α integration with error control, joint reactions (done); M3 force library
 //! (function forces, follower loads, joint springs, bushings; done);
-//! M4 assembly wiring. Nothing here pre-seeds M5 (contact/friction).
+//! M4 kernel-neutral integration surface (each consumer — any CAD kernel —
+//! writes its own adapter). Nothing here pre-seeds M5 (contact/friction).
 
 pub mod asmt;
 pub mod body;

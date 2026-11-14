@@ -10,7 +10,8 @@ when the crate became an independent library (2026-11-14).
 (mass / inertia / frame) + joints + drivers + force elements in, per-time
 state trajectories and joint reactions out. Position-level solving reuses
 `rcad-gcs`'s rigid-pose family; velocity/acceleration levels and time
-integration are homegrown (BDF).** The benchmark tier is SolidWorks Motion
+integration are homegrown (index-3 HHT-α).** Kernel-neutral: any CAD kernel
+or application can drive it; adapters live with the consumer. The benchmark tier is SolidWorks Motion
 (Adams kernel, the Inventor Dynamic Simulation lineage); like `rcad-gcs`:
 pure math, zero OCCT dependency, consumes numbers not B-rep, deterministic
 output.
@@ -20,16 +21,16 @@ output.
 | Dimension | Decision |
 |---|---|
 | Dependencies | glam / serde / thiserror / **rcad-gcs** (position-level IC). Zero OCCT, zero rcad-kernel/B-rep |
-| Input | Numbers and frames: bodies (mass, com, inertia about com), markers, joints, driver curves, force parameters. Mass properties arrive as numbers (the kernel's GProp output, converted to SI by the caller) |
+| Input | Numbers and frames: bodies (mass, com, inertia about com), markers, joints, driver curves, force parameters. Mass properties arrive as numbers (whatever mass-property tool the consumer uses, converted to SI by the caller) |
 | Output | Per-time state (per-body position/pose/velocity/acceleration) + **joint reactions (λ)** + energy/momentum audit |
 | Determinism | Entities numbered by stable key order (OndselSolver's lesson: name-dictionary order → reproducible equation numbering); no parallelism; same input → same output |
 | Errors | `{code, detail, hint}` data, never a panic at the boundary |
-| Wiring | `rcad-assembly` depends on it and keeps the Assembly→system conversion in the assembly domain |
+| Consumers | **Kernel-neutral library.** Any CAD kernel or application may use it; every adapter (assembly → `System` conversion, mate mapping, units, result presentation) is the consumer's and lives in the consumer's code. This crate ships no kernel-specific code and no kernel dependency |
 | File discipline | single file < 2000 lines; English comments; `cargo check -p rcad-mbd` after each edit |
 
-**Zero contact with the parity chain**: `rcad-kernel` / `rcad-brep` /
-`rcad-algo` / `rcad-modeling` never depend on this crate (direction is
-assembly → mbd → gcs, all product layer).
+**No kernel in the dependency graph**: the crate depends on math crates and
+`rcad-gcs` only; it never depends on a CAD kernel, B-rep or document model,
+and no kernel is assumed by its API.
 
 ## 2. Benchmark definition: what counts as "commercial grade"
 
@@ -38,7 +39,7 @@ Simulation (same Adams lineage). Capability → milestone mapping:
 
 | Commercial capability | Milestone | Note |
 |---|---|---|
-| Joint set (revolute/prismatic/cylindrical/spherical/planar/universal + fixed) | M0/M1 | Same vocabulary as the assembly domain's `PairType` |
+| Joint set (revolute/prismatic/cylindrical/spherical/planar/universal + fixed) | M0/M1 | The lower pairs every CAD mate set maps onto |
 | Closed-loop assembly simulation (no user break) | M1 | The natural advantage of maximal coordinates |
 | Drivers (displacement/velocity/acceleration curves, constant/piecewise-linear/function) | M1 | `MotorProfile` semantics folded in |
 | Kinematic output: position/velocity/acceleration | M1 | = OndselSolver's `runKINEMATIC` tier |
@@ -160,7 +161,7 @@ Onshape / Fusion / CATIA DMU):
   acceleration. **Done** — Tier A against the crank-slider closed form.
 - Left for later: a distance-between-points primitive (Ondsel
   `SphSphJoint`), mate-level conversion from `rcad-gcs::rigid3d`
-  constraints (an M4 concern, in the assembly domain).
+  constraints (the consumer's adapter).
 
 ### M2 review — decided (2026-11-14)
 **Index-3 HHT-α** (the Adams HHT integrator), **no Baumgarte** (that belongs
@@ -210,7 +211,7 @@ Cards (one commit each):
 
 - Equations of motion (maximal coordinates): `M·v̇ + b = Q(q, v, t) − Jᵀ·λ`;
 - Mass matrix `M` (per-body 6×6 composition; the parallel-axis theorem's
-  numbers come from the kernel's GProp);
+  numbers come from the caller's mass-property tool);
 - Gates: §6 Tier A dynamics benchmarks + long-run momentum-drift audit +
   Tier B reactions against OndselSolver.
 - Estimate: the largest card on the route (the gap doc's T4 estimate of 4+
@@ -233,14 +234,23 @@ Cards:
    BUSHING), their potentials; Tier A damped torsional pendulum, static and
    dynamic multi-turn winding, bushing deflection, frequencies, energy.
 
-### M4 Assembly-domain wiring (document/session/tool surface)
-Assembly → mbd system conversion (instances + mass properties → Body;
-`joint_derive` → Joint; `Motor`/`MotionStudy` → Driver/Study);
-`assembly.study.run` switches to the real backend; result tables (frame
-poses + reactions) reach tool output. `rcad-assembly::motion`'s chained
-`simulate` is downgraded to a chain special case or retired (decided at the
-Rule-4 review). Gates: tool-surface six points + `engine_tool_coverage` +
-existing gates all green.
+### M4 Integration surface (kernel-neutral) — proposed
+*Re-scoped 2026-11-15: the crate is a standalone, kernel-neutral library;
+wiring it into any particular CAD kernel or application (rcad included)
+is that consumer's work, in that consumer's repository.* What this crate
+owes every consumer instead:
+- a **study API**: an analysis described as data (kinematic sweep, dynamic
+  simulation, static equilibrium; output grid, integrator settings,
+  requested measures) run through one entry point to one result type;
+- **result tables**: per-frame poses, velocities, accelerations, joint
+  reactions and driver efforts, requested measures, energy/momentum
+  audit — serde-stable (golden tests) plus a flat CSV export;
+- an **integrator's guide** with a neutral sample adapter (an example that
+  maps a generic "parts + mates + motors" description onto `System`),
+  unit-conversion and marker-placement conventions, error-code catalogue;
+- API-stability notes (what is public and versioned).
+Gates: serde goldens of studies and results, the sample adapter running
+in CI, doc examples compiling.
 
 ### M5 (separate card, not in this roadmap's schedule)
 Joint friction (Stribeck), contact/impact (Chrono/MuJoCo class problems),
@@ -285,9 +295,9 @@ determinism tests (same input → same trajectory).
   the gap doc names (weighted-least-squares IC / redundant-constraint
   reporting / sparse ladder / analytic derivatives) enter `rcad-gcs`'s own
   ledger on demand, not as a prerequisite of this card.
-- `rcad-assembly::kinematics` / `transmission` / `joint_derive` / `motion`:
-  the assembly domain's vocabulary and the Tier-1 chained special case; M4
-  reviews the fate of `simulate` when wiring.
+- Consumers (rcad or any other kernel / application): they build `System`s
+  from their own assembly models and present the results; their adapters
+  and any legacy special-case solvers they retire are their own business.
 - OndselSolver gap doc: this card is the crate-ization of its Phase 4 plus
   the landing point of the Phase 5 reference test system; Phase 3 (assembly
   solver alignment) remains an independent prerequisite, not blocked by this
@@ -300,8 +310,8 @@ determinism tests (same input → same trajectory).
 - Risk 1: BDF + stabilization tuning (Baumgarte β/γ) — pin every parameter
   against the Tier A benchmarks; "it runs" is not acceptance.
 - Risk 2: dense-Jacobian performance wall — correctness first, speed later;
-  sparsification is registered as a formal departure (the parity discipline
-  does not apply to this crate, but the determinism discipline does).
+  resolved by the performance channel (sparse per-step work; the
+  determinism discipline still holds: same input, same trajectory).
 - Risk 3: redundant constraints (real CAD assemblies are over-constrained
   often) — M1 must detect and report them (OndselSolver's pivoted
   factorization mechanism is portable), or a commercial assembly crashes on
@@ -312,7 +322,7 @@ determinism tests (same input → same trajectory).
 ## 9. Construction order
 
 M0 → M1 (including the Tier B reference pipeline) → M2 (largest card) → M3
-→ M4 → (M5 separate card). Each card is an independent commit + full gate;
+→ performance → M4 (integration surface) → Tier C → (M5 separate card). Each card is an independent commit + full gate;
 if stopped midway before M2, M1's output (closed-loop kinematic simulation)
 is independently usable and better than the current Tier-1 chained
 special case.
