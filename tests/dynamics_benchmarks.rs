@@ -468,12 +468,9 @@ fn grid(end: f64, step: f64) -> Vec<f64> {
     (0..=n).map(|k| k as f64 * step).collect()
 }
 
+/// Fixed-step settings (the accuracy and conservation benchmarks).
 fn hht(alpha: f64, step: f64) -> HhtSettings {
-    HhtSettings {
-        alpha,
-        step,
-        ..HhtSettings::default()
-    }
+    HhtSettings::fixed(alpha, step)
 }
 
 /// Complete elliptic integral of the first kind by the AGM.
@@ -836,8 +833,18 @@ fn pendulum_hinge_reaction() {
     let c = DQuat::from_rotation_z(1.1) * DVec3::new(0.0, -L, 0.0);
     let a_com = a.linear + a.angular.cross(c) + v.angular.cross(v.angular.cross(c));
     let g = DVec3::new(0.0, -G, 0.0);
-    close_v(r.force_on_j, M * (a_com - g), 1e-10, "hinge force on the link");
-    close_v(r.force_on_i, -M * (a_com - g), 1e-10, "hinge force on the ground");
+    close_v(
+        r.force_on_j,
+        M * (a_com - g),
+        1e-10,
+        "hinge force on the link",
+    );
+    close_v(
+        r.force_on_i,
+        -M * (a_com - g),
+        1e-10,
+        "hinge force on the ground",
+    );
     assert!(r.torque_on_i.length() < 1e-10 && r.torque_on_j.length() < 1e-10);
 }
 
@@ -860,14 +867,28 @@ fn driver_effort_is_the_motor_torque() {
     let kin = solve_frame(&sys, t, None).unwrap();
     let frame = forward_dynamics(&sys, t, &kin.state, &kin.velocity).unwrap();
     let reactions = frame.reactions(&sys).unwrap();
-    let motor = reactions.iter().find(|r| r.owner == EquationOwner::Driver(0)).unwrap();
+    let motor = reactions
+        .iter()
+        .find(|r| r.owner == EquationOwner::Driver(0))
+        .unwrap();
     let s = sys.drivers[0].sample(t);
     let torque = i_hinge() * s.acceleration + M * G * L * s.value.sin();
     close(motor.effort.unwrap(), torque, 1e-9, "effort");
-    close_v(motor.torque_on_j, DVec3::Z * torque, 1e-9, "torque on the link");
+    close_v(
+        motor.torque_on_j,
+        DVec3::Z * torque,
+        1e-9,
+        "torque on the link",
+    );
     assert!(motor.force_on_i.length() < 1e-12);
-    let hinge = reactions.iter().find(|r| r.owner == EquationOwner::Joint(JointId(1))).unwrap();
-    assert!(hinge.torque_on_i.z.abs() < 1e-10, "the hinge carries no axial torque");
+    let hinge = reactions
+        .iter()
+        .find(|r| r.owner == EquationOwner::Joint(JointId(1)))
+        .unwrap();
+    assert!(
+        hinge.torque_on_i.z.abs() < 1e-10,
+        "the hinge carries no axial torque"
+    );
 }
 
 /// Static equilibrium reactions: the side-loaded pendulum's hinge carries
@@ -886,7 +907,12 @@ fn static_hinge_reaction() {
     .unwrap();
     let eq = static_equilibrium(&sys, 0.0, None).unwrap();
     let r = &eq.reactions(&sys).unwrap()[0];
-    close_v(r.force_on_i, push + DVec3::new(0.0, -M * G, 0.0), 1e-9, "load on the ground");
+    close_v(
+        r.force_on_i,
+        push + DVec3::new(0.0, -M * G, 0.0),
+        1e-9,
+        "load on the ground",
+    );
     assert!(r.torque_on_i.length() < 1e-9);
 }
 
@@ -908,7 +934,12 @@ fn indeterminate_reactions_are_flagged() {
     let a = frame.acceleration[&BodyId(2)];
     let c = DQuat::from_rotation_z(0.9) * DVec3::new(0.0, -L, 0.0);
     let a_com = a.linear + a.angular.cross(c);
-    close_v(total, M * (a_com - DVec3::new(0.0, -G, 0.0)), 1e-9, "total hinge load");
+    close_v(
+        total,
+        M * (a_com - DVec3::new(0.0, -G, 0.0)),
+        1e-9,
+        "total hinge load",
+    );
 
     let sys = four_bar();
     let frame = dynamic_ic(&sys, 0.0).unwrap();
@@ -923,6 +954,254 @@ fn indeterminate_reactions_are_flagged() {
                 r.owner
             );
         }
-        assert!(r.torque_on_i.z.abs() < 1e-9, "revolutes carry no axial torque");
+        assert!(
+            r.torque_on_i.z.abs() < 1e-9,
+            "revolutes carry no axial torque"
+        );
     }
+}
+
+// ── variable step and long-run audits ───────────────────────────────────
+
+fn adaptive(tol: f64) -> HhtSettings {
+    HhtSettings {
+        error_tol: Some(tol),
+        ..HhtSettings::default()
+    }
+}
+
+/// Constant acceleration has no local error: the controller doubles the
+/// step up to the output spacing and the parabola stays exact.
+#[test]
+fn free_fall_grows_the_step() {
+    let mut sys = System::new("fall").with_standard_gravity();
+    let mut b = part(
+        2,
+        1.5,
+        DVec3::ZERO,
+        DVec3::splat(0.02),
+        DVec3::ZERO,
+        DQuat::IDENTITY,
+    );
+    b.velocity = DVec3::new(1.0, 0.0, 4.0);
+    sys.add_body(b.clone()).unwrap();
+    let sim = simulate(&sys, &grid(5.0, 0.5), &HhtSettings::default()).unwrap();
+    for f in &sim.frames {
+        let t = f.time;
+        let expected = b.velocity * t + 0.5 * DVec3::new(0.0, 0.0, -G) * t * t;
+        close_v(
+            f.state.body_pose(BodyId(2)).unwrap().0,
+            expected,
+            1e-10,
+            "parabola",
+        );
+    }
+    assert!(sim.stats.steps < 30, "{:?}", sim.stats);
+    assert_eq!(sim.stats.rejected, 0);
+}
+
+/// The pendulum (θ₀ = 0.5) under error control, against a fine fixed-step
+/// reference: per-step control of an O(h³) local error gives a global error
+/// ∝ tol^(2/3) — observed order 2/3 between tolerances a factor 100
+/// apart — at a fraction of the fixed-step work.
+#[test]
+fn error_control_tracks_the_tolerance() {
+    let sys = pendulum(0.5);
+    let times = grid(4.0, 0.1);
+    let reference = simulate(&sys, &times, &hht(0.0, 1e-4)).unwrap();
+    let angle = |f: &DynamicFrame| f.state.joint_angle(JointId(1)).unwrap();
+    let mut previous: Option<f64> = None;
+    for tol in [1e-5, 1e-7, 1e-9] {
+        let sim = simulate(&sys, &times, &adaptive(tol)).unwrap();
+        let worst = sim
+            .frames
+            .iter()
+            .zip(&reference.frames)
+            .map(|(f, r)| (angle(f) - angle(r)).abs())
+            .fold(0.0, f64::max);
+        eprintln!(
+            "tol {tol:e}: global angle error {worst:.2e}, {:?}",
+            sim.stats
+        );
+        assert!(
+            worst < 20.0 * tol.powf(2.0 / 3.0),
+            "tol {tol:e}: error {worst:e}"
+        );
+        if let Some(coarser) = previous {
+            let order = (coarser / worst).log10() / 2.0;
+            assert!(
+                (0.5..0.85).contains(&order),
+                "observed tolerance order {order}"
+            );
+        }
+        previous = Some(worst);
+        if tol == 1e-5 {
+            assert!(
+                sim.stats.steps < 400,
+                "coarse tolerance takes big steps: {:?}",
+                sim.stats
+            );
+        }
+    }
+}
+
+/// A stiff, critically damped spring: the controller resolves the fast
+/// transient and then opens the step; the trajectory follows the closed
+/// form.
+#[test]
+fn stiff_transient_then_rest() {
+    let amplitude = 0.04;
+    let k = 4.0e4;
+    let mut sys = spring_mass(FREE + amplitude, 2.0 * (k * M).sqrt());
+    if let Some(ForceElement::SpringDamper { stiffness, .. }) = sys.forces.get_mut(&ForceId(1)) {
+        *stiffness = k;
+    }
+    let omega = (k / M).sqrt();
+    let sim = simulate(&sys, &grid(2.0, 0.01), &HhtSettings::default()).unwrap();
+    let worst = sim
+        .frames
+        .iter()
+        .map(|f| {
+            let exact = amplitude * (-omega * f.time).exp() * (1.0 + omega * f.time);
+            (f.state.body_pose(BodyId(2)).unwrap().0.x - FREE - exact).abs()
+        })
+        .fold(0.0, f64::max);
+    eprintln!("stiff: worst {worst:.2e}, {:?}", sim.stats);
+    assert!(worst < 1e-3 * amplitude, "error {worst:e}");
+    assert!(sim.stats.steps < 1000, "{:?}", sim.stats);
+}
+
+/// The worst relative drift of angular momentum (about the world origin),
+/// linear momentum and energy over a trajectory.
+fn drift(sys: &System, sim: &Simulation) -> (f64, f64, f64) {
+    let f0 = &sim.frames[0];
+    let p0 = momentum(sys, &f0.state, &f0.velocity).unwrap();
+    let e0 = energy(sys, &f0.state, &f0.velocity).unwrap().total();
+    let (mut dh, mut dp, mut de) = (0.0_f64, 0.0_f64, 0.0_f64);
+    for f in &sim.frames {
+        let p = momentum(sys, &f.state, &f.velocity).unwrap();
+        dh = dh.max((p.angular - p0.angular).length() / p0.angular.length());
+        dp = dp.max((p.linear - p0.linear).length() / p0.linear.length().max(1e-3));
+        de = de.max((energy(sys, &f.state, &f.velocity).unwrap().total() - e0).abs() / e0);
+    }
+    (dh, dp, de)
+}
+
+/// The industry audit of integrator quality: an unloaded system's angular
+/// momentum. A free asymmetric body spun near its intermediate axis (the
+/// unstable, tumbling case) and a two-body chain on a spherical joint keep
+/// their angular momentum about the world origin, linear momentum and
+/// energy over a long run. The drift is second order in the step at any α
+/// (the Arnold–Brüls form keeps HHT second order with the configuration-
+/// dependent world inertia). Constrained systems run with α < 0: the
+/// trapezoidal rule (α = 0) leaves the index-3 constraint-force modes
+/// undamped and is only weakly stable on them — the chain blows up after
+/// ~9 s at α = 0 — which is why HHT-I3 defaults to α = −0.3.
+#[test]
+fn unloaded_momentum_drift_audit() {
+    let tumbler = {
+        let mut sys = System::new("tumbler");
+        let mut b = part(
+            2,
+            2.0,
+            DVec3::new(0.05, 0.0, 0.0),
+            DVec3::new(0.01, 0.02, 0.03),
+            DVec3::ZERO,
+            DQuat::IDENTITY,
+        );
+        b.velocity = DVec3::new(0.1, 0.0, 0.0);
+        b.angular_velocity = DVec3::new(0.05, 6.0, 0.02);
+        sys.add_body(b).unwrap();
+        sys
+    };
+    let chain = {
+        let mut sys = System::new("chain");
+        let mut b1 = part(
+            2,
+            1.0,
+            DVec3::new(0.1, 0.0, 0.0),
+            DVec3::new(0.002, 0.004, 0.005),
+            DVec3::ZERO,
+            DQuat::IDENTITY,
+        );
+        b1.angular_velocity = DVec3::new(0.3, 0.2, 3.0);
+        let mut b2 = part(
+            3,
+            0.7,
+            DVec3::new(0.1, 0.0, 0.0),
+            DVec3::new(0.001, 0.003, 0.003),
+            DVec3::new(0.2, 0.0, 0.0),
+            DQuat::IDENTITY,
+        );
+        b2.angular_velocity = DVec3::new(-1.0, 2.0, -0.5);
+        sys.add_body(b1).unwrap();
+        sys.add_body(b2).unwrap();
+        marker(&mut sys, 1, 2, DVec3::new(0.2, 0.0, 0.0), DQuat::IDENTITY);
+        marker(&mut sys, 2, 3, DVec3::ZERO, DQuat::IDENTITY);
+        joint(&mut sys, 1, JointKind::Spherical, 1, 2);
+        sys
+    };
+    // (system, end time, settings, label, H / P / E bounds)
+    let runs = [
+        (
+            &tumbler,
+            20.0,
+            hht(0.0, 1e-3),
+            "tumbler α=0 h=1ms",
+            [1e-3, 1e-4, 1e-5],
+        ),
+        (
+            &tumbler,
+            20.0,
+            hht(0.0, 5e-4),
+            "tumbler α=0 h=0.5ms",
+            [3e-4, 3e-5, 3e-6],
+        ),
+        (
+            &tumbler,
+            20.0,
+            hht(DEFAULT_ALPHA, 1e-3),
+            "tumbler α=-0.3 h=1ms",
+            [2e-3, 2e-4, 1e-5],
+        ),
+        (
+            &tumbler,
+            20.0,
+            HhtSettings::default(),
+            "tumbler default",
+            [2e-2, 2e-3, 1e-3],
+        ),
+        (
+            &chain,
+            10.0,
+            hht(DEFAULT_ALPHA, 1e-3),
+            "chain α=-0.3 h=1ms",
+            [5e-5, 2e-5, 2e-5],
+        ),
+        (
+            &chain,
+            10.0,
+            HhtSettings::default(),
+            "chain default",
+            [2e-3, 5e-4, 1e-3],
+        ),
+    ];
+    let mut tumbler_alpha0 = Vec::new();
+    for (sys, end, settings, label, bound) in runs {
+        let sim = simulate(sys, &grid(end, 0.05), &settings).unwrap();
+        let (dh, dp, de) = drift(sys, &sim);
+        eprintln!(
+            "{label}: |ΔH|/|H| {dh:.2e}, |ΔP| {dp:.2e}, |ΔE|/E {de:.2e}, {:?}",
+            sim.stats
+        );
+        assert!(
+            dh < bound[0] && dp < bound[1] && de < bound[2],
+            "{label}: drift H {dh:e} P {dp:e} E {de:e}"
+        );
+        if label.starts_with("tumbler α=0") {
+            tumbler_alpha0.push(dh);
+        }
+    }
+    let order = (tumbler_alpha0[0] / tumbler_alpha0[1]).log2();
+    assert!((order - 2.0).abs() < 0.2, "momentum drift order {order}");
 }

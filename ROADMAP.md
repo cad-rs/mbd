@@ -176,7 +176,7 @@ Correction to the earlier plan: OndselSolver *does* take part — its
 kinematic output carries per-joint/driver reaction series
 (`FXonI … TZonI`, inverse dynamics), a Tier B reference for λ recovery.
 
-### M2 Forward dynamics + integration (the largest card) — in progress
+### M2 Forward dynamics + integration (the largest card) — **done**
 Cards (one commit each):
 1. **Done** — equations of motion, dynamic IC, static equilibrium
    (`dynamics` module): mass matrix about the body origin with the
@@ -195,8 +195,13 @@ Cards (one commit each):
    indeterminate directions under redundancy) + Tier B against
    OndselSolver's joint/motion reaction series on all seven cases (two
    with gravity): worst 1.4e-10 N.
-4. Variable-step error control + long-run angular-momentum drift audit
-   (unloaded system — the industry metric of integrator quality) + docs.
+4. **Done** — variable-step error control (Zienkiewicz–Xie estimate,
+   hysteresis, default tol 1e-6 m/rad) + long-run angular-momentum drift
+   audit (unloaded tumbling body and spherical chain: drift second order
+   in h). Found and fixed on the way: classical HHT drops to first order
+   with the configuration-dependent world inertia — the integrator now
+   uses the Arnold–Brüls generalized-α form (second order for any α).
+   Recorded: α = 0 is only weakly stable on index-3 constraint modes.
 
 - Equations of motion (maximal coordinates): `M·v̇ + b = Q(q, v, t) − Jᵀ·λ`;
 - Mass matrix `M` (per-body 6×6 composition; the parallel-axis theorem's

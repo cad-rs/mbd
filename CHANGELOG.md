@@ -10,7 +10,34 @@
   validation gates; serde golden round-trip tests.
 - Dependency on `rcad-gcs` declared for the M1 position-level solver.
 
-## Unreleased (M1 + M1.5 complete, M2 in progress)
+## Unreleased (M1 + M1.5 + M2 complete)
+
+### M2 card 4 — variable step, momentum audit (M2 complete)
+
+- **Fix: HHT now in the Arnold–Brüls generalized-α form** — the equations
+  of motion hold at `t + h` with the true accelerations, an auxiliary
+  acceleration carries the α weighting into Newmark. The classical
+  recursion (card 2) drops to first order with the configuration-dependent
+  world inertia `R·I·Rᵀ`: a free tumbling body at α = −0.3 lost 6.8 % of
+  its angular momentum in 20 s; now 7.3e-4, second order like α = 0.
+  Results at α = 0 are unchanged.
+- Variable step (`HhtSettings::error_tol`, default `Some(1e-6)` m/rad ≈
+  Adams `ERROR = 1e-3` mm; `HhtSettings::fixed(α, h)` for fixed steps):
+  Zienkiewicz–Xie estimate on the true accelerations, `0.9·r^(−1/3)` with
+  hysteresis, no growth after a rejection, steps spread evenly to each
+  output time (a sliver step re-excites the index-3 λ oscillation: 16 % →
+  0 % rejections on the chain audit). `min_step` / `max_step` bounds;
+  `DEFAULT_ERROR_TOL`. Iteration matrix reused across step changes (its
+  scaled constraint blocks are h-independent); Newton tolerance 1e-9 and
+  five stale iterations before a rebuild (four-bar: 31k → 12k residual
+  evaluations, results unchanged).
+- Tier A: free fall grows the step (exact, < 30 steps); global error
+  ∝ tol^(2/3) on the pendulum (observed order 0.64 / 0.65); a stiff
+  critically damped spring (k = 4e4) resolved in 292 steps; **unloaded
+  momentum drift audit** — free body tumbling about its intermediate axis
+  (20 s) and a spinning two-body spherical chain (10 s): angular momentum
+  drift second order in h (5.2e-4 → 1.3e-4), chain 2.1e-5 at α = −0.3.
+  Documented: α = 0 is only weakly stable on index-3 constraint modes.
 
 ### M2 card 3 — joint reactions (λ recovery) + Tier B reactions
 
@@ -185,5 +212,6 @@
 
 ### Next
 
-- M2 card 4: variable-step local error control for HHT-α, the long-run
-  angular-momentum drift audit of an unloaded system, M2 close-out docs.
+- M3 force library (torsional spring, time/state-function forces, forced
+  oscillation and energy audits); performance (sparse Jacobian, analytic
+  iteration matrix) once systems pass ~100 bodies.

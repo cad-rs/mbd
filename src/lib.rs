@@ -20,8 +20,9 @@
 //!
 //! Milestones: M0 data model + golden (done); M1 kinematic three levels
 //! (position via `rcad-gcs`, velocity/acceleration linear solves against
-//! the analytic Jacobian, redundancy diagnosis, time sweep); M2 forward
-//! dynamics + implicit integration + reaction recovery; M3 force library;
+//! the analytic Jacobian, redundancy diagnosis, time sweep; done); M2 forward
+//! dynamics (equations of motion, dynamic IC, static equilibrium), index-3
+//! HHT-α integration with error control, joint reactions (done); M3 force library;
 //! M4 assembly wiring. Nothing here pre-seeds M5 (contact/friction).
 
 pub mod asmt;
