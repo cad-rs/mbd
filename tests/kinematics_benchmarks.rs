@@ -22,6 +22,8 @@ fn body(id: u64, name: &str, at: DVec3, grounded: bool) -> Body {
         translation: at,
         rotation: DQuat::IDENTITY,
         grounded,
+        velocity: DVec3::ZERO,
+        angular_velocity: DVec3::ZERO,
     }
 }
 

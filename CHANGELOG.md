@@ -10,7 +10,38 @@
   validation gates; serde golden round-trip tests.
 - Dependency on `rcad-gcs` declared for the M1 position-level solver.
 
-## Unreleased (M1 + M1.5 complete)
+## Unreleased (M1 + M1.5 complete, M2 in progress)
+
+### M2 card 1 — equations of motion, dynamic IC, static equilibrium
+
+- Integrator route decided at the M2 review: index-3 HHT-α (Adams HHT;
+  default α = −0.3, variable step), no Baumgarte; rotations advance by a
+  Lie-group increment; output frames project velocity/acceleration/λ onto
+  the constraint levels (integrator state untouched).
+- `Body::velocity` / `Body::angular_velocity`: authored initial velocities
+  (world frame, body origin — Adams PART `VX…WZ`), serde-defaulted and
+  omitted when zero; a merged group takes its root's.
+- `dynamics` module: `mass_matrix` (6×6 about the body origin with the
+  center-of-mass offset, world inertia `R·I·Rᵀ`) and the velocity-quadratic
+  term; generalized forces from gravity, `SpringDamper` (zero-length
+  springs isotropic), `AppliedForce`, `AppliedTorque`;
+  `forward_dynamics` (saddle-point solve `[M Jᵀ; J 0]` through the
+  rank-revealing factorization — redundant equations listed, minimum-norm
+  multipliers; a fully driven mechanism gives inverse-dynamics efforts);
+  `velocity_ic` (kinetic-energy-norm projection of authored velocities);
+  `dynamic_ic`; `static_equilibrium` (Newton on `Q = Jᵀλ, Φ = 0`, tangent
+  stiffness by central differences, line search; driver multipliers are
+  holding efforts); `energy` / `momentum` audits.
+- New codes `dynamics_singular`, `static_not_converged`,
+  `degenerate_force`.
+- Tests (`tests/dynamics_benchmarks.rs`, Tier A): free tumbling body (com
+  at g, Euler equations), pendulum θ̈ = −(mgl/I_o)·sin θ at five states,
+  velocity IC keeps hinge-axis momentum, redundant coaxial hinge, driven
+  pendulum = inverse dynamics (motor torque), spring-mass-damper, energy
+  and momentum audit, static spring extension mg/k, side-loaded pendulum
+  tan θ = F·L/(m·g·l), driver holding torque, failure codes; unit tests
+  for the mass matrix (energy, SPD), the bias (momentum rate) and the
+  hinge multipliers (= hinge load).
 
 ### M1.5 CAD-grade kinematics
 
@@ -108,5 +139,6 @@
 
 ### Next
 
-- OndselSolver `.asmt` reference poses (Tier B); then the M1.5 proposals
-  (joint primitives, couplers, rigid-group merging, measures) or M2.
+- M2 card 2: the HHT-α index-3 integrator + Tier A time-integration
+  benchmarks (free fall, pendulum period + energy, spring-mass ω, damping
+  regimes).

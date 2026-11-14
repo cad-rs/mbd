@@ -216,6 +216,8 @@ pub fn merge_fixed_groups(sys: &System) -> Result<MergedSystem, MbdError> {
                 translation: rb.translation,
                 rotation: rb.rotation,
                 grounded: members.iter().any(|b| sys.bodies[b].grounded),
+                velocity: rb.velocity,
+                angular_velocity: rb.angular_velocity,
             },
         );
     }
@@ -336,6 +338,8 @@ mod tests {
             translation: at,
             rotation: DQuat::IDENTITY,
             grounded,
+            velocity: DVec3::ZERO,
+            angular_velocity: DVec3::ZERO,
         }
     }
 

@@ -43,7 +43,7 @@ Simulation (same Adams lineage). Capability → milestone mapping:
 | Drivers (displacement/velocity/acceleration curves, constant/piecewise-linear/function) | M1 | `MotorProfile` semantics folded in |
 | Kinematic output: position/velocity/acceleration | M1 | = OndselSolver's `runKINEMATIC` tier |
 | Gravity / spring / damper / applied force-torque | M3 | |
-| **Dynamic simulation + time integration** (BDF variable order/step, error control) | M2 | Adams GSTIFF tier |
+| **Dynamic simulation + time integration** (index-3 HHT-α, variable step, error control) | M2 | Adams HHT tier |
 | **Joint reactions** (bearing loads — the commercial headline feature) | M2 | λ recovery |
 | Result trajectories / energy / momentum audit | M2 | |
 | Joint friction | M5 | Commercial staple but mathematically dirty (Stribeck); after reactions |
@@ -157,24 +157,47 @@ Onshape / Fusion / CATIA DMU):
   `SphSphJoint`), mate-level conversion from `rcad-gcs::rigid3d`
   constraints (an M4 concern, in the assembly domain).
 
-### M2 review note (proposed)
-The index-3 implicit route (Adams GSTIFF / HHT-α with scaling) does not
-need Baumgarte; Baumgarte belongs to the index-1 ODE route. Pick one route
-at the M2 review. M2 also needs per-body initial velocities in the data
-model and naturally yields static equilibrium (Creo static / Inventor
-unknown force) at little cost.
+### M2 review — decided (2026-11-14)
+**Index-3 HHT-α** (the Adams HHT integrator), **no Baumgarte** (that belongs
+to the index-1 ODE route). Default α = −0.3 (Adams' default: light
+numerical damping of the high frequencies, negligible at low ones) with
+variable-step local error control; the conservation audits run α = 0 at a
+fixed step. Rotations advance by a Lie-group increment `R ← exp(Δθ)·R`
+(Newmark formulas in the world-frame tangent space); the Newton matrix is
+scaled by `1/(β·h²)` (Negrut et al.). Index 3 holds the position
+constraints only — velocities drift O(h²) off the velocity constraints —
+so **output frames are projected**: velocity, acceleration and λ are
+re-solved on the velocity/acceleration constraint levels at each output
+instant, the integrator state itself is not touched (stabilized index-2
+is a possible later option). M2 also adds per-body initial velocities and
+static equilibrium (Creo static / Inventor unknown force).
 
-### M2 Forward dynamics + integration (the largest card)
-- Equations of motion (maximal coordinates): `M·qdd = Q(q, qd, t) − Φᵀ·λ`;
+Correction to the earlier plan: OndselSolver *does* take part — its
+kinematic output carries per-joint/driver reaction series
+(`FXonI … TZonI`, inverse dynamics), a Tier B reference for λ recovery.
+
+### M2 Forward dynamics + integration (the largest card) — in progress
+Cards (one commit each):
+1. **Done** — equations of motion, dynamic IC, static equilibrium
+   (`dynamics` module): mass matrix about the body origin with the
+   center-of-mass offset (`R·I·Rᵀ`), velocity-quadratic term, gravity and
+   the M0 force elements, forward dynamics as a rank-revealing
+   saddle-point solve (redundancy listed, minimum-norm λ; a fully driven
+   mechanism = inverse dynamics), mass-weighted velocity IC, Newton static
+   equilibrium, energy/momentum audits; Tier A instantaneous benchmarks.
+2. HHT-α index-3 integrator + Tier A time benchmarks (free fall, pendulum
+   period + energy, spring-mass ω = √(k/m), damping three regimes).
+3. **λ recovery = joint reactions** (force/torque at the joint markers,
+   non-unique under redundancy, flagged) + Tier B against OndselSolver's
+   joint reaction series.
+4. Variable-step error control + long-run angular-momentum drift audit
+   (unloaded system — the industry metric of integrator quality) + docs.
+
+- Equations of motion (maximal coordinates): `M·v̇ + b = Q(q, v, t) − Jᵀ·λ`;
 - Mass matrix `M` (per-body 6×6 composition; the parallel-axis theorem's
   numbers come from the kernel's GProp);
-- Index-3 DAE: implicit BDF multistep (orders 1–3 to start) + Baumgarte
-  stabilization (or projection stabilization — pick one and record the
-  trade-off), variable-step error control;
-- **λ recovery = joint reactions** (auditable every step);
-- Gates: §6 Tier A dynamics benchmarks + long-run momentum-drift audit
-  (angular-momentum drift on an unloaded system is the industry metric of
-  integrator quality) + OndselSolver does not participate (it has none).
+- Gates: §6 Tier A dynamics benchmarks + long-run momentum-drift audit +
+  Tier B reactions against OndselSolver.
 - Estimate: the largest card on the route (the gap doc's T4 estimate of 4+
   weeks is reasonable).
 

@@ -47,6 +47,8 @@ fn body(id: u64, at: DVec3, rotation: DQuat, grounded: bool) -> Body {
         translation: at,
         rotation,
         grounded,
+        velocity: DVec3::ZERO,
+        angular_velocity: DVec3::ZERO,
     }
 }
 

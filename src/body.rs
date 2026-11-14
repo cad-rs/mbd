@@ -34,6 +34,21 @@ pub struct Body {
     pub rotation: DQuat,
     /// A grounded body is fixed in the inertial frame (the assembly's base).
     pub grounded: bool,
+    /// Initial linear velocity of the body-frame origin, world frame (m/s)
+    /// — the Adams PART `VX VY VZ`. The dynamic initial condition projects
+    /// the authored velocities onto the joint constraints (mass-weighted
+    /// least squares), so they need not be consistent. Ignored when
+    /// grounded and by the kinematic levels.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub velocity: DVec3,
+    /// Initial angular velocity, world frame (rad/s) — the Adams PART
+    /// `WX WY WZ`.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub angular_velocity: DVec3,
+}
+
+fn is_zero(v: &DVec3) -> bool {
+    *v == DVec3::ZERO
 }
 
 /// A frame rigidly attached to a body — what joints and force elements

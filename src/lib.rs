@@ -28,6 +28,7 @@ pub mod asmt;
 pub mod body;
 pub mod coupler;
 pub mod driver;
+pub mod dynamics;
 pub mod error;
 pub mod force;
 mod jet;
@@ -42,6 +43,10 @@ pub use asmt::{write_asmt, AsmtSimulation};
 pub use body::{Body, BodyId, Marker, MarkerId};
 pub use coupler::{Coupler, CouplerId, CouplerTerm};
 pub use driver::{Driver, DriverProfile, DriverSample, DriverSlot};
+pub use dynamics::{
+    dynamic_ic, energy, forward_dynamics, mass_matrix, momentum, static_equilibrium, velocity_ic, DynamicFrame,
+    Energy, Momentum, StaticEquilibrium,
+};
 pub use error::{codes, MbdError};
 pub use force::{ForceElement, ForceId};
 pub use joint::{Joint, JointId, JointKind};
@@ -72,6 +77,8 @@ mod tests {
             translation: DVec3::ZERO,
             rotation: DQuat::IDENTITY,
             grounded: true,
+            velocity: DVec3::ZERO,
+            angular_velocity: DVec3::ZERO,
         })
         .unwrap();
         sys.add_body(Body {
@@ -83,6 +90,8 @@ mod tests {
             translation: DVec3::ZERO,
             rotation: DQuat::IDENTITY,
             grounded: false,
+            velocity: DVec3::ZERO,
+            angular_velocity: DVec3::ZERO,
         })
         .unwrap();
         for (id, body) in [(1, BodyId(1)), (2, BodyId(2))] {

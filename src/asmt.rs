@@ -432,6 +432,8 @@ mod tests {
                 translation: DVec3::ZERO,
                 rotation: DQuat::IDENTITY,
                 grounded,
+                velocity: DVec3::ZERO,
+                angular_velocity: DVec3::ZERO,
             })
             .unwrap();
             sys.add_marker(Marker {

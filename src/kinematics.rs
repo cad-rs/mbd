@@ -57,10 +57,10 @@ pub const BODY_TWIST: usize = 6;
 /// and what [`KinematicState::joint_angle`] reports.
 #[derive(Debug, Clone, PartialEq)]
 pub struct KinematicState {
-    params: Vec<f64>,
-    order: Vec<BodyId>,
-    slot_of: BTreeMap<BodyId, usize>,
-    angles: BTreeMap<JointId, f64>,
+    pub(crate) params: Vec<f64>,
+    pub(crate) order: Vec<BodyId>,
+    pub(crate) slot_of: BTreeMap<BodyId, usize>,
+    pub(crate) angles: BTreeMap<JointId, f64>,
 }
 
 impl KinematicState {
@@ -136,7 +136,7 @@ impl KinematicState {
         }
     }
 
-    fn normalize_quaternions(&mut self) {
+    pub(crate) fn normalize_quaternions(&mut self) {
         for slot in 0..self.order.len() {
             let (t, r) = read_pose(&self.params, slot);
             let base = slot * BODY_PARAMS;
@@ -145,11 +145,11 @@ impl KinematicState {
     }
 }
 
-fn pose_params(t: DVec3, r: DQuat) -> [f64; BODY_PARAMS] {
+pub(crate) fn pose_params(t: DVec3, r: DQuat) -> [f64; BODY_PARAMS] {
     [t.x, t.y, t.z, r.x, r.y, r.z, r.w]
 }
 
-fn read_pose(params: &[f64], slot: usize) -> (DVec3, DQuat) {
+pub(crate) fn read_pose(params: &[f64], slot: usize) -> (DVec3, DQuat) {
     let p = &params[slot * BODY_PARAMS..(slot + 1) * BODY_PARAMS];
     (
         DVec3::new(p[0], p[1], p[2]),
@@ -335,30 +335,30 @@ fn wrap_angle(a: f64) -> f64 {
 
 /// The kinematic problem at a driver time: the system plus the slot and
 /// equation layouts.
-struct Problem<'a> {
-    sys: &'a System,
-    slot_of: BTreeMap<BodyId, usize>,
+pub(crate) struct Problem<'a> {
+    pub(crate) sys: &'a System,
+    pub(crate) slot_of: BTreeMap<BodyId, usize>,
     /// Tangent column base per slot (`None` = grounded).
-    col_of: Vec<Option<usize>>,
-    n_cols: usize,
-    rows: Vec<EquationRef>,
+    pub(crate) col_of: Vec<Option<usize>>,
+    pub(crate) n_cols: usize,
+    pub(crate) rows: Vec<EquationRef>,
     /// Joint rows (contiguous at the front).
-    n_joint_rows: usize,
+    pub(crate) n_joint_rows: usize,
     /// Joint + coupler rows (the mechanism, contiguous at the front).
-    n_mechanism_rows: usize,
-    time: f64,
+    pub(crate) n_mechanism_rows: usize,
+    pub(crate) time: f64,
     /// Unwrapping references for rotation coordinates (the seed's tracked
     /// angles).
-    refs: BTreeMap<JointId, f64>,
+    pub(crate) refs: BTreeMap<JointId, f64>,
     /// Rotation coordinates prescribed by a driver: the driver index (its
     /// value is the unwrapping reference).
-    rotation_driver: BTreeMap<JointId, usize>,
+    pub(crate) rotation_driver: BTreeMap<JointId, usize>,
     /// Authored values of every coordinate a coupler uses.
-    authored: BTreeMap<(JointId, DriverSlot), f64>,
+    pub(crate) authored: BTreeMap<(JointId, DriverSlot), f64>,
 }
 
 impl<'a> Problem<'a> {
-    fn new(sys: &'a System, time: f64, refs: &BTreeMap<JointId, f64>) -> Self {
+    pub(crate) fn new(sys: &'a System, time: f64, refs: &BTreeMap<JointId, f64>) -> Self {
         let mut slot_of = BTreeMap::new();
         let mut col_of = Vec::with_capacity(sys.bodies.len());
         let mut n_cols = 0;
@@ -408,11 +408,11 @@ impl<'a> Problem<'a> {
         problem
     }
 
-    fn n_bodies(&self) -> usize {
+    pub(crate) fn n_bodies(&self) -> usize {
         self.col_of.len()
     }
 
-    fn frame(&self, params: &[f64], motion: &[Twist], marker: MarkerId) -> FrameJet {
+    pub(crate) fn frame(&self, params: &[f64], motion: &[Twist], marker: MarkerId) -> FrameJet {
         marker_frame(self.sys, &self.slot_of, params, motion, marker)
     }
 
@@ -445,7 +445,7 @@ impl<'a> Problem<'a> {
     }
 
     /// The tracked rotation angles at `params` (after a converged solve).
-    fn track_angles(&self, params: &[f64]) -> BTreeMap<JointId, f64> {
+    pub(crate) fn track_angles(&self, params: &[f64]) -> BTreeMap<JointId, f64> {
         let rest = vec![Twist::default(); self.n_bodies()];
         rotation_joints(self.sys)
             .map(|j| (j.id, self.coordinate(params, &rest, j.id, DriverSlot::Rotation).v))
@@ -456,7 +456,7 @@ impl<'a> Problem<'a> {
     /// joint rows, coupler rows (`Σ cᵢ·(qᵢ − qᵢ_authored)`), then the drivers'
     /// measured joint coordinates (time terms excluded — the callers add
     /// them).
-    fn jets(&self, params: &[f64], motion: &[Twist]) -> Vec<Jet> {
+    pub(crate) fn jets(&self, params: &[f64], motion: &[Twist]) -> Vec<Jet> {
         let mut out = Vec::with_capacity(self.rows.len());
         let mut buf = [Jet::default(); 6];
         for joint in self.sys.joints.values().filter(|j| !j.suppressed) {
@@ -491,7 +491,7 @@ impl<'a> Problem<'a> {
 
     /// The constraint residuals at the position level (drivers: measured
     /// minus prescribed, angles wrapped).
-    fn constraint_residuals(&self, params: &[f64], out: &mut [f64]) {
+    pub(crate) fn constraint_residuals(&self, params: &[f64], out: &mut [f64]) {
         let rest = vec![Twist::default(); self.n_bodies()];
         let jets = self.jets(params, &rest);
         for (k, (row, jet)) in self.rows.iter().zip(&jets).enumerate() {
@@ -533,7 +533,7 @@ impl<'a> Problem<'a> {
 
     /// The analytic tangent-space Jacobian (rows × 6·free bodies): column
     /// `c` is the rate of every row under a unit motion in coordinate `c`.
-    fn jacobian(&self, params: &[f64]) -> Vec<Vec<f64>> {
+    pub(crate) fn jacobian(&self, params: &[f64]) -> Vec<Vec<f64>> {
         let mut j = vec![vec![0.0; self.n_cols]; self.rows.len()];
         let mut motion = vec![Twist::default(); self.n_bodies()];
         for slot in 0..self.n_bodies() {
@@ -556,7 +556,7 @@ impl<'a> Problem<'a> {
     }
 
     /// Tangent solution vector → per-slot twists (grounded: zero).
-    fn twists(&self, x: &[f64]) -> Vec<Twist> {
+    pub(crate) fn twists(&self, x: &[f64]) -> Vec<Twist> {
         self.col_of
             .iter()
             .map(|col| match col {
@@ -569,7 +569,7 @@ impl<'a> Problem<'a> {
             .collect()
     }
 
-    fn refs(&self, indices: &[usize]) -> Vec<EquationRef> {
+    pub(crate) fn refs(&self, indices: &[usize]) -> Vec<EquationRef> {
         indices.iter().map(|&k| self.rows[k]).collect()
     }
 
@@ -618,7 +618,7 @@ impl<'a> Problem<'a> {
 }
 
 /// Human-readable equation list for error details.
-fn describe(sys: &System, refs: &[EquationRef]) -> String {
+pub(crate) fn describe(sys: &System, refs: &[EquationRef]) -> String {
     let names: Vec<String> = refs
         .iter()
         .map(|r| match r.owner {
@@ -639,7 +639,7 @@ fn describe(sys: &System, refs: &[EquationRef]) -> String {
     names.join(", ")
 }
 
-fn check_state(sys: &System, state: &KinematicState) -> Result<(), MbdError> {
+pub(crate) fn check_state(sys: &System, state: &KinematicState) -> Result<(), MbdError> {
     if !state.order.iter().eq(sys.bodies.keys()) {
         return Err(MbdError::new(
             codes::STATE_MISMATCH,
@@ -826,6 +826,8 @@ mod tests {
             translation: DVec3::ZERO,
             rotation: DQuat::IDENTITY,
             grounded: true,
+            velocity: DVec3::ZERO,
+            angular_velocity: DVec3::ZERO,
         }
     }
 
@@ -843,6 +845,8 @@ mod tests {
             translation: DVec3::ZERO,
             rotation: DQuat::IDENTITY,
             grounded: false,
+            velocity: DVec3::ZERO,
+            angular_velocity: DVec3::ZERO,
         })
         .unwrap();
         for (id, body) in [(1, BodyId(1)), (2, BodyId(2))] {

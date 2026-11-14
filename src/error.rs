@@ -64,4 +64,14 @@ pub mod codes {
     pub const INCONSISTENT_WELD: &str = "inconsistent_weld";
     /// The system uses something the `.asmt` export does not cover.
     pub const ASMT_UNSUPPORTED: &str = "asmt_unsupported";
+    /// The dynamics saddle-point equations are inconsistent: a lock-up /
+    /// toggle position, drivers over-prescribing a degree of freedom, or a
+    /// load along a direction nothing resists (no mass, stiffness or
+    /// constraint).
+    pub const DYNAMICS_SINGULAR: &str = "dynamics_singular";
+    /// The static-equilibrium Newton iteration did not converge.
+    pub const STATIC_NOT_CONVERGED: &str = "static_not_converged";
+    /// A force element is geometrically degenerate (a spring with coincident
+    /// markers but a nonzero free length).
+    pub const DEGENERATE_FORCE: &str = "degenerate_force";
 }
