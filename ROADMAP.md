@@ -72,9 +72,13 @@ Jacobian is dense (slow past ~100 bodies) — performance work (sparsification
 / body partitioning) is a post-M2 channel, not an early milestone.
 
 State representation: position = translation + unit quaternion (same manifold
-as gcs); velocity/acceleration = translational + angular (body or inertial
-frame — M1 fixes one and the whole crate is consistent). The unit constraint
-(quaternion norm) joins the joint equations in the constraint set.
+as gcs); velocity/acceleration = translational + angular, **fixed at M1 to the
+inertial (world) frame**: per free body, the linear rate of the body-frame
+origin and the angular rate, both world-frame (`Twist`, 6 tangent
+coordinates; every body-fixed vector `a` then has `ȧ = ω×a`, which keeps the
+Jacobian a set of cross products). M2's Euler equations use the world-frame
+inertia `R·I·Rᵀ`. The unit constraint (quaternion norm) joins the joint
+equations only at the position level; the tangent-space levels have none.
 
 ## 4. Milestones
 
@@ -83,19 +87,61 @@ frame — M1 fixes one and the whole crate is consistent). The unit constraint
 (BTreeMap stable order) + serde + golden. Gates: golden bytes stable +
 `cargo test -p rcad-mbd`.
 
-### M1 Kinematic three levels (= the full OndselSolver tier, the real body of closed-loop Tier 1)
-- Position-level IC: joints → gcs constraints, `rigid3d` solve (assembly
-  initial pose).
+### M1 Kinematic three levels (= the full OndselSolver tier, the real body of closed-loop Tier 1) — **Tier A done, Tier B open**
+- Position-level IC: the joint residuals (own formulation, every row a dot
+  product) on the `rcad-gcs` damped Newton core; seedable
+  (`position_ic_from`) so a sweep stays on one assembly branch; rotation
+  drivers wrap their residual so a motor may run any number of turns.
+  **Done.**
 - Velocity level: `Φ_q·qd = −Φ_t + driver velocity`, one linear solve
-  (OndselSolver's VelIC approach: no iteration).
+  (OndselSolver's VelIC approach: no iteration). **Done.**
 - Acceleration level: `Φ_q·qdd = γ(q, qd, t)` (velocity-quadratic right
-  side) + driver acceleration.
-- Drivers: `Driver` (body/joint + displacement/velocity/acceleration curve,
-  `MotorProfile` semantics).
-- Gates: §6 Tier A analytic benchmarks all green + OndselSolver `.asmt`
-  reference-pose comparison (Tier B, reusing the gap doc Phase 5 methodology
-  — the `.asmt` text format is dependency-free; hand-written samples feed an
-  independent OndselSolver exe producing reference JSON).
+  side) + driver acceleration. **Done.**
+- The Jacobian and `γ` are analytic: the residuals are evaluated on
+  second-order jets (forward mode), so the three levels share one
+  formulation. `rcad-gcs` exposes only its finite-difference Newton
+  publicly; its analytic Jacobian, pivoted QR and diagnosis are
+  `pub(crate)`, so the crate carries its own dense rank-revealing QR
+  (`linalg.rs`) — a candidate to move into `rcad-gcs` once it exports one.
+- Redundancy (Risk 3): rank-revealing QR of `Φ_qᵀ` → DOF, mobility,
+  redundant and conflicting equations (`diagnose`); redundant rows are
+  skipped by the linear solves and listed per frame. **Done.**
+- Drivers: constant rate, keyframes, harmonic, `STEP5`, clamped cubic
+  spline, each with exact first/second derivatives. **Done.** (Drivers on
+  general relative coordinates / point motion: see M1.5.)
+- Sweep: `kinematic_sweep` with a second-order Taylor predictor seed;
+  free DOF and toggle positions are data (`underdetermined_motion`,
+  `kinematic_singular`). **Done.**
+- Gates: §6 Tier A crank-slider (3 revolutions, position/velocity/
+  acceleration vs closed form) and four-bar (Freudenstein residual, branch
+  continuity, rocker rate/acceleration) **green** (`tests/kinematics_benchmarks.rs`);
+  OndselSolver `.asmt` reference-pose comparison (Tier B, reusing the gap
+  doc Phase 5 methodology — the `.asmt` text format is dependency-free;
+  hand-written samples feed an independent OndselSolver exe producing
+  reference JSON) **open**.
+
+### M1.5 CAD-grade kinematics (proposed, pending review)
+What the commercial CAD motion tools have at the kinematic level that the
+seven lower pairs do not cover (benchmarked against SolidWorks Motion /
+Inventor Dynamic Simulation / Creo Mechanism, and the kinematic-only tier
+Onshape / Fusion / CATIA DMU):
+- Joint primitives (Adams JPRIM: inline, inplane, orientation, parallel
+  axes, perpendicular) so CAD mates map one to one — the vocabulary
+  `rcad-gcs::rigid3d::ConstraintKind` already has.
+- Couplers: gear, rack-and-pinion, screw, general linear coupler (one
+  velocity-ratio equation each; the Tier A gear benchmark needs it).
+- Rigid-group merging: bodies joined by `Fixed` joints collapse to one body
+  with combined mass properties before solving (fasteners dominate CAD
+  assemblies).
+- Measures: any marker's position/velocity/acceleration, relative joint
+  coordinates, in a chosen frame (trace paths, motion plots).
+
+### M2 review note (proposed)
+The index-3 implicit route (Adams GSTIFF / HHT-α with scaling) does not
+need Baumgarte; Baumgarte belongs to the index-1 ODE route. Pick one route
+at the M2 review. M2 also needs per-body initial velocities in the data
+model and naturally yields static equilibrium (Creo static / Inventor
+unknown force) at little cost.
 
 ### M2 Forward dynamics + integration (the largest card)
 - Equations of motion (maximal coordinates): `M·qdd = Q(q, qd, t) − Φᵀ·λ`;
@@ -139,15 +185,17 @@ src/
 ├── driver.rs       // drivers (curves + slots)
 ├── force.rs        // force elements (gravity/spring/damper/applied)
 ├── system.rs       // System assembly + stable-order numbering + IC entry
-├── kinematics.rs   // three levels: position (delegates to gcs) / velocity / acceleration
+├── jet.rs          // second-order jets: residual + Jacobian column + γ from one formulation
+├── linalg.rs       // dense rank-revealing QR (redundant/conflicting rows, min-norm solves)
+├── kinematics.rs   // three levels: position (delegates to gcs) / velocity / acceleration + sweep
 ├── dynamics.rs     // mass matrix, right-hand side, λ recovery
 ├── integrate.rs    // BDF(1-3) + step control + stabilization
 ├── results.rs      // trajectories / reactions / energy audit (serializable)
 └── error.rs        // {code, detail, hint}
 ```
 
-(`kinematics.rs` / `dynamics.rs` / `integrate.rs` / `results.rs` arrive with
-M1/M2; `driver.rs` splits out of `joint.rs` when the driver curves land.)
+(`kinematics.rs` / `jet.rs` / `linalg.rs` / `driver.rs` landed with M1;
+`dynamics.rs` / `integrate.rs` / `results.rs` arrive with M2.)
 
 ## 6. Verification system (three layers, spanning all milestones)
 

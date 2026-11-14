@@ -1,10 +1,13 @@
-//! Joints (kinematic constraints between two markers) and drivers (which
-//! joint slots move over time). The joint vocabulary mirrors the assembly
-//! domain's `PairType`.
+//! Joints (kinematic constraints between two markers) and their constraint
+//! equations. The joint vocabulary mirrors the assembly domain's `PairType`.
+//! Drivers live in [`crate::driver`] (re-exported here for the M0 paths).
 
 use serde::{Deserialize, Serialize};
 
 use crate::body::MarkerId;
+use crate::jet::{FrameJet, Jet};
+
+pub use crate::driver::{Driver, DriverProfile, DriverSample, DriverSlot};
 
 /// Stable joint identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -34,11 +37,33 @@ pub enum JointKind {
 impl JointKind {
     /// The number of relative degrees of freedom this joint leaves.
     pub fn remaining_dof(self) -> usize {
+        6 - self.constraint_count()
+    }
+
+    /// The number of independent constraint equations this joint kind
+    /// imposes (the relative DOF it removes from the 6 between two bodies).
+    pub fn constraint_count(self) -> usize {
         match self {
-            JointKind::Revolute | JointKind::Prismatic => 1,
-            JointKind::Cylindrical | JointKind::Universal => 2,
+            JointKind::Revolute | JointKind::Prismatic => 5,
+            JointKind::Cylindrical | JointKind::Universal => 4,
             JointKind::Spherical | JointKind::Planar => 3,
-            JointKind::Fixed => 0,
+            JointKind::Fixed => 6,
+        }
+    }
+
+    /// Whether a driver may prescribe `slot` on this kind. Rotation is the
+    /// angle about the common Z axis; translation is the offset along it.
+    /// Planar translation (two directions) and the universal joint's two
+    /// rotations have no single slot and are not drivable.
+    pub fn drives(self, slot: DriverSlot) -> bool {
+        match slot {
+            DriverSlot::Rotation => matches!(
+                self,
+                JointKind::Revolute | JointKind::Cylindrical | JointKind::Planar
+            ),
+            DriverSlot::Translation => {
+                matches!(self, JointKind::Prismatic | JointKind::Cylindrical)
+            }
         }
     }
 }
@@ -57,61 +82,74 @@ pub struct Joint {
     pub suppressed: bool,
 }
 
-/// Which slot of a joint a driver moves.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum DriverSlot {
-    /// Joint rotation (rad).
-    Rotation,
-    /// Joint translation (m).
-    Translation,
+/// Write one joint's constraint residual jets into `out`; returns the count
+/// (= [`JointKind::constraint_count`]).
+///
+/// The formulations, over the world frames of the two markers (`dp = p2 −
+/// p1`, axes `x1 y1 z1` / `x2 y2 z2`); every row is a dot product, so its
+/// derivatives are exact:
+/// - `Revolute`: origin coincidence (3) + `z2 ⟂ x1, y1` (2).
+/// - `Prismatic`: relative orientation locked (`x2·y1 = x2·z1 = y2·z1 = 0`,
+///   3) + the offset is axial (`dp ⟂ x1, y1`, 2).
+/// - `Cylindrical`: `z2 ⟂ x1, y1` (2) + `dp ⟂ x1, y1` (2).
+/// - `Spherical`: origin coincidence (3).
+/// - `Planar`: `z2 ⟂ x1, y1` (2) + `dp ⟂ z1` (1).
+/// - `Universal`: origin coincidence (3) + `z1 ⟂ z2` (1).
+/// - `Fixed`: origin coincidence (3) + relative orientation locked (3).
+///
+/// Known limitation (shared with the dot-product formulations of the
+/// commercial solvers): the axis and orientation rows are also satisfied by
+/// the 180°-flipped configurations, so a seed far from the authored pose may
+/// converge to a flipped assembly.
+pub(crate) fn joint_rows(kind: JointKind, f1: &FrameJet, f2: &FrameJet, out: &mut [Jet]) -> usize {
+    let dp = f2.p - f1.p;
+    let rows: &[Jet] = match kind {
+        JointKind::Revolute => &[
+            dp.x(),
+            dp.y(),
+            dp.z(),
+            f1.x.dot(f2.z),
+            f1.y.dot(f2.z),
+        ],
+        JointKind::Prismatic => &[
+            f1.y.dot(f2.x),
+            f1.z.dot(f2.x),
+            f1.z.dot(f2.y),
+            dp.dot(f1.x),
+            dp.dot(f1.y),
+        ],
+        JointKind::Cylindrical => &[
+            f1.x.dot(f2.z),
+            f1.y.dot(f2.z),
+            dp.dot(f1.x),
+            dp.dot(f1.y),
+        ],
+        JointKind::Spherical => &[dp.x(), dp.y(), dp.z()],
+        JointKind::Planar => &[f1.x.dot(f2.z), f1.y.dot(f2.z), dp.dot(f1.z)],
+        JointKind::Universal => &[dp.x(), dp.y(), dp.z(), f1.z.dot(f2.z)],
+        JointKind::Fixed => &[
+            dp.x(),
+            dp.y(),
+            dp.z(),
+            f1.y.dot(f2.x),
+            f1.z.dot(f2.x),
+            f1.z.dot(f2.y),
+        ],
+    };
+    out[..rows.len()].copy_from_slice(rows);
+    rows.len()
 }
 
-/// How the driven value evolves over time.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "profile", rename_all = "snake_case")]
-pub enum DriverProfile {
-    /// `value(t) = start + rate * t`.
-    Constant { start: f64, rate: f64 },
-    /// Linear interpolation through `(time_s, value)` keyframes sorted by
-    /// time, clamped at the ends.
-    Keyframes(Vec<(f64, f64)>),
-}
-
-/// A prescribed motion on one slot of one joint (the MbD "motor"). A joint
-/// slot with a driver loses that degree of freedom to prescription; joints
-/// without any driver keep their free degrees of freedom for the dynamics
-/// to determine.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct Driver {
-    pub joint: JointId,
-    pub slot: DriverSlot,
-    pub profile: DriverProfile,
-}
-
-impl Driver {
-    /// The driven value at `t` (s).
-    pub fn value_at(&self, t: f64) -> f64 {
-        match &self.profile {
-            DriverProfile::Constant { start, rate } => start + rate * t,
-            DriverProfile::Keyframes(keys) => {
-                let Some(first) = keys.first() else { return 0.0 };
-                if t <= first.0 {
-                    return first.1;
-                }
-                for pair in keys.windows(2) {
-                    let (t0, v0) = pair[0];
-                    let (t1, v1) = pair[1];
-                    if t <= t1 {
-                        let span = t1 - t0;
-                        if span <= 0.0 {
-                            return v1;
-                        }
-                        return v0 + (v1 - v0) * ((t - t0) / span);
-                    }
-                }
-                keys.last().map(|k| k.1).unwrap_or(0.0)
-            }
-        }
+/// The joint coordinate a driver slot measures, as a jet: the rotation angle
+/// `atan2(x2·y1, x2·x1)` (in `(−π, π]`; the caller unwraps it against the
+/// prescribed value) or the axial offset `dp·z1`. `None` when the slot is not
+/// drivable on the kind (rejected by validation before any solve).
+pub(crate) fn joint_coordinate(kind: JointKind, slot: DriverSlot, f1: &FrameJet, f2: &FrameJet) -> Option<Jet> {
+    if !kind.drives(slot) {
+        return None;
     }
+    Some(match slot {
+        DriverSlot::Rotation => Jet::atan2(f1.y.dot(f2.x), f1.x.dot(f2.x)),
+        DriverSlot::Translation => (f2.p - f1.p).dot(f1.z),
+    })
 }

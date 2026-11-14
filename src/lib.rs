@@ -14,23 +14,36 @@
 //!   equation numbering and serialized bytes are reproducible.
 //! - **Failures are data**: [`MbdError`] `{code, detail, hint}`.
 //!
-//! Milestones: M0 (this) data model + golden; M1 kinematic three levels
-//! (position via `rcad-gcs`, velocity/acceleration linear solves); M2
-//! forward dynamics + BDF integration + reaction recovery; M3 force library;
+//! - **Velocities in the world frame**: per free body, the linear velocity of
+//!   the body-frame origin and the angular velocity, both inertial
+//!   ([`Twist`]).
+//!
+//! Milestones: M0 data model + golden (done); M1 kinematic three levels
+//! (position via `rcad-gcs`, velocity/acceleration linear solves against
+//! the analytic Jacobian, redundancy diagnosis, time sweep); M2 forward
+//! dynamics + implicit integration + reaction recovery; M3 force library;
 //! M4 assembly wiring. Nothing here pre-seeds M5 (contact/friction).
 
 pub mod body;
+pub mod driver;
 pub mod error;
 pub mod force;
+mod jet;
 pub mod joint;
 pub mod kinematics;
+mod linalg;
 pub mod system;
 
 pub use body::{Body, BodyId, Marker, MarkerId};
+pub use driver::{Driver, DriverProfile, DriverSample, DriverSlot};
 pub use error::{codes, MbdError};
 pub use force::{ForceElement, ForceId};
-pub use joint::{Driver, DriverProfile, DriverSlot, Joint, JointId, JointKind};
-pub use kinematics::{equation_count, position_ic, KinematicState, BODY_PARAMS};
+pub use joint::{Joint, JointId, JointKind};
+pub use kinematics::{
+    diagnose, equation_count, kinematic_sweep, position_ic, position_ic_from, solve_frame,
+    EquationOwner, EquationRef, KinematicDiagnosis, KinematicFrame, KinematicState, Twist,
+    BODY_PARAMS, BODY_TWIST,
+};
 pub use system::{System, STANDARD_GRAVITY};
 
 #[cfg(test)]
@@ -184,12 +197,36 @@ mod tests {
         let keyed = Driver {
             joint: JointId(1),
             slot: DriverSlot::Translation,
-            profile: DriverProfile::Keyframes(vec![(0.0, 0.0), (1.0, 10.0), (2.0, 10.0)]),
+            profile: DriverProfile::Keyframes {
+                points: vec![(0.0, 0.0), (1.0, 10.0), (2.0, 10.0)],
+            },
         };
         assert!((keyed.value_at(-1.0) - 0.0).abs() < 1e-12);
         assert!((keyed.value_at(0.5) - 5.0).abs() < 1e-12);
         assert!((keyed.value_at(9.0) - 10.0).abs() < 1e-12);
+        assert!((keyed.sample(0.5).velocity - 10.0).abs() < 1e-12);
         assert_eq!(JointKind::Revolute.remaining_dof(), 1);
         assert_eq!(JointKind::Fixed.remaining_dof(), 0);
+    }
+
+    /// Every driver profile survives the serde round trip (the internally
+    /// tagged enum needs struct variants: a tagged newtype holding a
+    /// sequence does not serialize).
+    #[test]
+    fn every_driver_profile_round_trips() {
+        let mut sys = pendulum();
+        let profiles = [
+            DriverProfile::Constant { start: 0.0, rate: 1.0 },
+            DriverProfile::Keyframes { points: vec![(0.0, 0.0), (1.0, 2.0)] },
+            DriverProfile::Harmonic { offset: 0.0, amplitude: 1.0, frequency_hz: 2.0, phase: 0.5 },
+            DriverProfile::Step5 { t0: 0.0, v0: 0.0, t1: 1.0, v1: 1.0 },
+            DriverProfile::Spline { points: vec![(0.0, 0.0), (1.0, 2.0), (2.0, 1.0)] },
+        ];
+        for profile in profiles {
+            sys.drivers[0].profile = profile;
+            let text = serde_json::to_string(&sys).expect("serializes");
+            let back: System = serde_json::from_str(&text).expect("deserializes");
+            assert_eq!(back, sys);
+        }
     }
 }

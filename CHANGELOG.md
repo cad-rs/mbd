@@ -10,15 +10,56 @@
   validation gates; serde golden round-trip tests.
 - Dependency on `rcad-gcs` declared for the M1 position-level solver.
 
-## Unreleased (M1 first slice)
+## Unreleased (M1)
+
+### Second slice: velocity / acceleration levels, redundancy, sweep
+
+- Velocity and acceleration levels: `solve_frame` (one instant, all three
+  levels) and `kinematic_sweep` (a time grid, each instant seeded from the
+  previous one by a second-order predictor). Velocities are world-frame
+  `Twist`s (linear rate of the body-frame origin + angular rate).
+- Analytic Jacobian and `γ`: the joint residuals are written once over
+  second-order jets (`jet.rs`); position residual, Jacobian column and
+  velocity-quadratic term come from the same code.
+- Redundancy diagnosis: a dense rank-revealing QR (`linalg.rs`);
+  `diagnose` reports DOF, mobility, redundant and conflicting equations;
+  the linear levels skip redundant rows; a failed position IC names the
+  conflicting equations.
+- Driver profiles (`driver.rs`, split out of `joint.rs` and re-exported
+  there): `Harmonic`, `Step5`, `Spline` (clamped cubic) next to `Constant`
+  and `Keyframes`, all with exact first/second derivatives
+  (`Driver::sample`).
+- `position_ic_from`: seeded position IC.
+- New codes: `duplicate_driver`, `bad_driver_profile`, `state_mismatch`,
+  `underdetermined_motion`, `kinematic_singular`, `bad_time_grid`.
+- Tier A benchmarks (`tests/kinematics_benchmarks.rs`): crank-slider over
+  three revolutions and four-bar (Freudenstein) over two, position /
+  velocity / acceleration against closed forms; both carry three redundant
+  equations; undriven and over-driven four-bars report as data.
+
+### Fixes
+
+- A rotation driver past ±π never converged (the residual compared an
+  `atan2` angle with the unbounded prescribed one); the residual is now
+  wrapped, so motors may run any number of revolutions.
+- Validation accepted planar translation and universal rotation drivers
+  that the solver silently ignored (a zero equation); they are rejected
+  now (`slot_unsupported`), and planar rotation is actually solved.
+- **Breaking (format):** `DriverProfile::Keyframes(Vec<_>)` becomes
+  `Keyframes { points }` — serde cannot serialize an internally tagged
+  newtype variant holding a sequence, so the old form never round-tripped.
+- A joint slot carrying two drivers is rejected (`duplicate_driver`), as
+  the field docs always said.
+
+### First slice
 
 - `kinematics` module: the flat per-body pose state (translation +
   quaternion), the joint constraint residuals for all seven joint kinds
   (revolute / prismatic / cylindrical / spherical / planar / universal /
   fixed), the driver equations, and the position initial condition as a
   damped Newton-Raphson solve on `rcad-gcs::numerics::newton_solve`.
-- Tests: residual layout consistency, the driver angle held by the solve
-  for a hinge, the suppressed-joint layout, and the validation gates.
-- Next: the velocity and acceleration levels (linear solves against the
-  same constraint Jacobian), then the four-bar / crank-slider analytic
-  benchmarks and the OndselSolver `.asmt` reference poses.
+
+### Next
+
+- OndselSolver `.asmt` reference poses (Tier B); then the M1.5 proposals
+  (joint primitives, couplers, rigid-group merging, measures) or M2.

@@ -39,4 +39,20 @@ pub mod codes {
     /// The kinematic position solve did not converge below the residual
     /// tolerance (over-constrained layout or a bad seed).
     pub const KINEMATICS_NOT_CONVERGED: &str = "kinematics_not_converged";
+    /// Two drivers prescribe the same slot of one joint.
+    pub const DUPLICATE_DRIVER: &str = "duplicate_driver";
+    /// A driver profile's data is unusable (non-finite, unsorted, too few
+    /// points).
+    pub const BAD_DRIVER_PROFILE: &str = "bad_driver_profile";
+    /// A seed state does not match the system's body table.
+    pub const STATE_MISMATCH: &str = "state_mismatch";
+    /// The velocity/acceleration levels need a fully prescribed motion: the
+    /// mechanism still has free degrees of freedom (add drivers).
+    pub const UNDERDETERMINED_MOTION: &str = "underdetermined_motion";
+    /// The velocity or acceleration equations are inconsistent: the
+    /// mechanism is at a lock-up / toggle position, or the drivers
+    /// over-prescribe a degree of freedom.
+    pub const KINEMATIC_SINGULAR: &str = "kinematic_singular";
+    /// A time grid is not finite and non-decreasing.
+    pub const BAD_TIME_GRID: &str = "bad_time_grid";
 }

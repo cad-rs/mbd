@@ -2,7 +2,7 @@
 //! order so equation numbering and serialized bytes are reproducible
 //! (OndselSolver's `createMbD` name-sort lesson).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use glam::DVec3;
 use serde::{Deserialize, Serialize};
@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use crate::body::{Body, BodyId, Marker, MarkerId};
 use crate::error::{codes, MbdError};
 use crate::force::{ForceElement, ForceId};
-use crate::joint::{Driver, DriverSlot, Joint, JointId, JointKind};
+use crate::joint::{Driver, DriverSlot, Joint, JointId};
 
 /// Standard gravity, SI (m/s²).
 pub const STANDARD_GRAVITY: f64 = 9.806_65;
@@ -23,7 +23,8 @@ pub struct System {
     pub bodies: BTreeMap<BodyId, Body>,
     pub markers: BTreeMap<MarkerId, Marker>,
     pub joints: BTreeMap<JointId, Joint>,
-    /// Drivers in authoring order (a joint slot carries at most one).
+    /// Drivers in authoring order (a joint slot carries at most one; the
+    /// validation gate enforces it).
     pub drivers: Vec<Driver>,
     pub forces: BTreeMap<ForceId, ForceElement>,
     /// Gravity in the inertial frame (m/s²); `None` = no gravity.
@@ -136,6 +137,7 @@ impl System {
                 }
             }
         }
+        let mut driven = BTreeSet::new();
         for driver in &self.drivers {
             let Some(joint) = self.joints.get(&driver.joint) else {
                 return Err(MbdError::new(
@@ -144,32 +146,35 @@ impl System {
                     "add the joint before driving it",
                 ));
             };
-            if !slot_is_dof(joint.kind, driver.slot) {
+            if !joint.kind.drives(driver.slot) {
                 return Err(MbdError::new(
                     codes::SLOT_UNSUPPORTED,
                     format!(
-                        "driver slot {:?} is not a degree of freedom of {:?} joint {} ({})",
+                        "driver slot {:?} is not a drivable degree of freedom of {:?} joint {} ({})",
                         driver.slot, joint.kind, joint.id.0, joint.name
                     ),
-                    "rotation drives revolute/cylindrical/planar/universal; translation drives prismatic/cylindrical/planar",
+                    "rotation drives revolute/cylindrical/planar; translation drives prismatic/cylindrical",
+                ));
+            }
+            if !driven.insert((driver.joint, driver.slot == DriverSlot::Rotation)) {
+                return Err(MbdError::new(
+                    codes::DUPLICATE_DRIVER,
+                    format!(
+                        "joint {} ({}) slot {:?} carries two drivers",
+                        joint.id.0, joint.name, driver.slot
+                    ),
+                    "a joint slot takes at most one driver; remove or merge the extra one",
+                ));
+            }
+            if let Err(reason) = driver.profile.check() {
+                return Err(MbdError::new(
+                    codes::BAD_DRIVER_PROFILE,
+                    format!("driver on joint {} ({}): {reason}", joint.id.0, joint.name),
+                    "fix the profile data (finite numbers, sorted times, enough points)",
                 ));
             }
         }
         Ok(())
-    }
-}
-
-/// Whether `slot` is one of the joint kind's remaining degrees of freedom.
-fn slot_is_dof(kind: JointKind, slot: DriverSlot) -> bool {
-    match slot {
-        DriverSlot::Rotation => matches!(
-            kind,
-            JointKind::Revolute | JointKind::Cylindrical | JointKind::Planar | JointKind::Universal
-        ),
-        DriverSlot::Translation => matches!(
-            kind,
-            JointKind::Prismatic | JointKind::Cylindrical | JointKind::Planar
-        ),
     }
 }
 

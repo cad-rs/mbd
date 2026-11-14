@@ -1,29 +1,50 @@
 //! Kinematic solving: the position initial condition, the velocity level and
-//! the acceleration level (M1).
+//! the acceleration level (M1), and the time sweep over them.
 //!
-//! The state is a flat parameter vector: per body, translation (3) +
-//! quaternion (4) = 7 slots. The constraint set is the per-body unit-norm
-//! equation plus, per joint, the joint equations (see [`joint_residuals`]),
-//! plus one equation per driver (the prescribed joint value). The position
-//! IC is a damped Newton-Raphson solve on the shared `rcad-gcs` numerics
-//! core; the velocity and acceleration levels are linear solves against the
-//! same constraint Jacobian (M1 second slice).
+//! **Coordinates.** The position state is a flat parameter vector: per body,
+//! translation (3) + quaternion (4) = 7 slots. The velocity and acceleration
+//! levels live in the tangent space instead: per free body, the linear
+//! velocity of the body-frame origin and the angular velocity, both in the
+//! inertial (world) frame ([`Twist`]) — 6 coordinates, no quaternion-rate
+//! redundancy. This is the crate-wide convention (roadmap §3).
 //!
-//! Everything here is pure math over the [`System`] data model: no B-rep, no
-//! time integration (that is M2).
+//! **Equations.** Per joint, the joint equations; per driver, the
+//! prescribed joint coordinate. The position IC adds one unit-norm equation
+//! per body (the quaternion manifold) and solves on the shared `rcad-gcs`
+//! Newton core. The velocity and acceleration levels are linear solves
+//! against the analytic tangent-space Jacobian, which comes from the same
+//! residual code evaluated on second-order jets ([`crate::jet`]), so the
+//! position residuals, the Jacobian and the quadratic term `γ` cannot drift
+//! apart.
+//!
+//! **Redundancy.** Real CAD assemblies are over-constrained (a planar
+//! four-bar built from 3D revolutes carries three redundant equations).
+//! Every linear solve goes through a rank-revealing factorization:
+//! dependent but consistent equations are reported as redundant and
+//! skipped; dependent inconsistent ones are conflicts and fail as data.
+//!
+//! **Angles.** A rotation driver's residual is the measured angle minus the
+//! prescribed one wrapped into `[−π, π)`, so a motor may run any number of
+//! revolutions; the pose is the same modulo a turn.
 
 use std::collections::BTreeMap;
+use std::f64::consts::{PI, TAU};
 
-use glam::{DMat3, DQuat, DVec3};
+use glam::{DQuat, DVec3};
 use rcad_gcs::numerics::{newton_solve, SolveResult as GcsSolveResult};
 
 use crate::body::{BodyId, MarkerId};
 use crate::error::{codes, MbdError};
-use crate::joint::{DriverSlot, JointKind};
+use crate::jet::{BodyMotion, FrameJet, Jet};
+use crate::joint::{joint_coordinate, joint_rows, DriverSlot, JointId};
+use crate::linalg::RowFactor;
 use crate::system::System;
 
 /// Parameter slots per body in the flat state vector.
 pub const BODY_PARAMS: usize = 7;
+
+/// Tangent coordinates per free body (linear + angular velocity).
+pub const BODY_TWIST: usize = 6;
 
 /// A kinematic state: per-body pose in a flat parameter vector.
 ///
@@ -46,15 +67,7 @@ impl KinematicState {
         for (slot, (id, body)) in sys.bodies.iter().enumerate() {
             order.push(*id);
             slot_of.insert(*id, slot);
-            params.extend_from_slice(&[
-                body.translation.x,
-                body.translation.y,
-                body.translation.z,
-                body.rotation.x,
-                body.rotation.y,
-                body.rotation.z,
-                body.rotation.w,
-            ]);
+            params.extend_from_slice(&pose_params(body.translation, body.rotation));
         }
         Self { params, order, slot_of }
     }
@@ -72,246 +85,373 @@ impl KinematicState {
     /// Read a body's pose (translation, unit quaternion).
     pub fn body_pose(&self, body: BodyId) -> Option<(DVec3, DQuat)> {
         let slot = *self.slot_of.get(&body)?;
+        Some(read_pose(&self.params, slot))
+    }
+
+    /// Overwrite a body's pose (the quaternion is normalized). Returns
+    /// `false` when the body is not in the state.
+    pub fn set_body_pose(&mut self, body: BodyId, translation: DVec3, rotation: DQuat) -> bool {
+        let Some(&slot) = self.slot_of.get(&body) else {
+            return false;
+        };
         let base = slot * BODY_PARAMS;
-        let p = self.params.get(base..base + BODY_PARAMS)?;
-        Some((
-            DVec3::new(p[0], p[1], p[2]),
-            DQuat::from_xyzw(p[3], p[4], p[5], p[6]).normalize(),
-        ))
+        self.params[base..base + BODY_PARAMS]
+            .copy_from_slice(&pose_params(translation, rotation.normalize()));
+        true
+    }
+
+    /// A body-fixed point (body-frame coordinates) in the world frame.
+    pub fn world_point(&self, body: BodyId, local: DVec3) -> Option<DVec3> {
+        let (t, r) = self.body_pose(body)?;
+        Some(t + r * local)
+    }
+
+    fn normalize_quaternions(&mut self) {
+        for slot in 0..self.order.len() {
+            let (t, r) = read_pose(&self.params, slot);
+            let base = slot * BODY_PARAMS;
+            self.params[base..base + BODY_PARAMS].copy_from_slice(&pose_params(t, r));
+        }
     }
 }
 
-/// The number of constraint equations for a system at a driver time:
-/// one unit-norm equation per body, the joint equations, and one equation
-/// per (unsuppressed) driver.
+fn pose_params(t: DVec3, r: DQuat) -> [f64; BODY_PARAMS] {
+    [t.x, t.y, t.z, r.x, r.y, r.z, r.w]
+}
+
+fn read_pose(params: &[f64], slot: usize) -> (DVec3, DQuat) {
+    let p = &params[slot * BODY_PARAMS..(slot + 1) * BODY_PARAMS];
+    (
+        DVec3::new(p[0], p[1], p[2]),
+        DQuat::from_xyzw(p[3], p[4], p[5], p[6]).normalize(),
+    )
+}
+
+/// A rigid-body velocity (or acceleration): the linear rate of the body
+/// frame origin and the angular rate, both in the world frame.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Twist {
+    pub linear: DVec3,
+    pub angular: DVec3,
+}
+
+impl Twist {
+    /// The rate of a body-fixed point at world arm `arm` (point minus body
+    /// origin) for a velocity twist: `v + ω × arm`.
+    pub fn point_velocity(&self, arm: DVec3) -> DVec3 {
+        self.linear + self.angular.cross(arm)
+    }
+}
+
+/// Which entity owns a constraint equation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum EquationOwner {
+    Joint(JointId),
+    /// A driver, by its index in [`System::drivers`].
+    Driver(usize),
+}
+
+/// One constraint equation: its owner and the row within the owner (joint
+/// rows follow the formulation order of the joint kind; a driver has one).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct EquationRef {
+    pub owner: EquationOwner,
+    pub row: usize,
+}
+
+/// The rank analysis of the constraint equations at a state.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct KinematicDiagnosis {
+    /// Tangent coordinates: 6 per free body.
+    pub coordinates: usize,
+    /// Rank of the full constraint Jacobian (joints + drivers).
+    pub rank: usize,
+    /// Degrees of freedom left with the drivers applied (`coordinates −
+    /// rank`): 0 is what a kinematic analysis needs.
+    pub dof: usize,
+    /// The mechanism's mobility, drivers removed (`coordinates −
+    /// rank(joint rows)`): how many drivers it takes to prescribe it.
+    pub mobility: usize,
+    /// Dependent equations consistent with the rest: removable without
+    /// changing the motion (their reactions are not unique).
+    pub redundant: Vec<EquationRef>,
+    /// Dependent equations inconsistent with the rest at this
+    /// linearization: no configuration satisfies everything.
+    pub conflicting: Vec<EquationRef>,
+}
+
+/// One solved instant: pose, velocity and acceleration of every body.
+#[derive(Debug, Clone, PartialEq)]
+pub struct KinematicFrame {
+    pub time: f64,
+    pub state: KinematicState,
+    /// Per-body velocity (grounded bodies carry zero).
+    pub velocity: BTreeMap<BodyId, Twist>,
+    /// Per-body acceleration (grounded bodies carry zero).
+    pub acceleration: BTreeMap<BodyId, Twist>,
+    /// The redundant equations skipped by the linear solves.
+    pub redundant: Vec<EquationRef>,
+}
+
+/// The number of equations the position IC solves for a system: one
+/// unit-norm equation per body, the joint equations, and one equation per
+/// (unsuppressed) driver.
 pub fn equation_count(sys: &System) -> usize {
-    let mut n = sys.bodies.len();
-    for joint in sys.joints.values() {
-        if !joint.suppressed {
-            n += joint.kind.constraint_count();
+    sys.bodies.len() + constraint_layout(sys).len()
+}
+
+/// The constraint equations (joints in id order, then drivers in authoring
+/// order), skipping suppressed joints and their drivers.
+fn constraint_layout(sys: &System) -> Vec<EquationRef> {
+    let mut rows = Vec::new();
+    for joint in sys.joints.values().filter(|j| !j.suppressed) {
+        for row in 0..joint.kind.constraint_count() {
+            rows.push(EquationRef { owner: EquationOwner::Joint(joint.id), row });
         }
     }
-    n += sys
-        .drivers
-        .iter()
-        .filter(|d| sys.joints.get(&d.joint).is_some_and(|j| !j.suppressed))
-        .count();
-    n
-}
-
-impl JointKind {
-    /// The number of independent constraint equations this joint kind
-    /// imposes (the relative DOF it removes from the 6 between two bodies).
-    pub fn constraint_count(self) -> usize {
-        match self {
-            JointKind::Revolute => 5,
-            JointKind::Prismatic => 5,
-            JointKind::Cylindrical => 4,
-            JointKind::Spherical => 3,
-            JointKind::Planar => 3,
-            JointKind::Universal => 4,
-            JointKind::Fixed => 6,
+    for (index, driver) in sys.drivers.iter().enumerate() {
+        if sys.joints.get(&driver.joint).is_some_and(|j| !j.suppressed) {
+            rows.push(EquationRef { owner: EquationOwner::Driver(index), row: 0 });
         }
     }
+    rows
 }
 
-/// A marker's world frame at a parameter vector: `(world position, world
-/// orientation)` of the marker's attached frame.
-fn marker_frame(sys: &System, slot_of: &BTreeMap<BodyId, usize>, params: &[f64], marker: MarkerId) -> (DVec3, DQuat) {
-    let m = &sys.markers[&marker];
-    let base = slot_of[&m.body] * BODY_PARAMS;
-    let t = DVec3::new(params[base], params[base + 1], params[base + 2]);
-    let q = DQuat::from_xyzw(params[base + 3], params[base + 4], params[base + 5], params[base + 6])
-        .normalize();
-    (t + q * m.translation, q * m.rotation)
+/// Wrap an angle into `[−π, π)`.
+fn wrap_angle(a: f64) -> f64 {
+    (a + PI).rem_euclid(TAU) - PI
 }
 
-/// Write one joint's constraint residuals into `out`; returns the count.
-///
-/// The formulations (all in the marker frames, `dp = p2 - p1`,
-/// `R_rel = R1^-1 R2`):
-/// - `Revolute`: origin coincidence (3) + the second marker's Z axis has no
-///   component perpendicular to the first's (2).
-/// - `Prismatic`: relative orientation identity (3, the upper-triangular
-///   off-diagonal rotation entries) + the offset is axial (2).
-/// - `Cylindrical`: axis parallelism (2) + axial offset (2).
-/// - `Spherical`: origin coincidence (3).
-/// - `Planar`: axis parallelism (2) + zero axial offset (1).
-/// - `Universal`: origin coincidence (3) + perpendicular axes (1).
-/// - `Fixed`: origin coincidence (3) + relative orientation identity (3).
-fn joint_residuals(
-    kind: JointKind,
-    p1: DVec3,
-    r1: DQuat,
-    p2: DVec3,
-    r2: DQuat,
-    out: &mut [f64],
-) -> usize {
-    let dp = p2 - p1;
-    let r_rel = r1.inverse() * r2;
-    let z_rel = r_rel * DVec3::Z;
-    let x1 = r1 * DVec3::X;
-    let y1 = r1 * DVec3::Y;
-    let z1 = r1 * DVec3::Z;
-    let m = DMat3::from_quat(r_rel);
-    match kind {
-        JointKind::Revolute => {
-            out[0] = dp.x;
-            out[1] = dp.y;
-            out[2] = dp.z;
-            out[3] = z_rel.x;
-            out[4] = z_rel.y;
-            5
-        }
-        JointKind::Prismatic => {
-            out[0] = m.x_axis.y;
-            out[1] = m.x_axis.z;
-            out[2] = m.y_axis.z;
-            out[3] = dp.dot(x1);
-            out[4] = dp.dot(y1);
-            5
-        }
-        JointKind::Cylindrical => {
-            out[0] = z_rel.x;
-            out[1] = z_rel.y;
-            out[2] = dp.dot(x1);
-            out[3] = dp.dot(y1);
-            4
-        }
-        JointKind::Spherical => {
-            out[0] = dp.x;
-            out[1] = dp.y;
-            out[2] = dp.z;
-            3
-        }
-        JointKind::Planar => {
-            out[0] = z_rel.x;
-            out[1] = z_rel.y;
-            out[2] = dp.dot(z1);
-            3
-        }
-        JointKind::Universal => {
-            out[0] = dp.x;
-            out[1] = dp.y;
-            out[2] = dp.z;
-            out[3] = z1.dot(r2 * DVec3::Z);
-            4
-        }
-        JointKind::Fixed => {
-            out[0] = dp.x;
-            out[1] = dp.y;
-            out[2] = dp.z;
-            out[3] = m.x_axis.y;
-            out[4] = m.x_axis.z;
-            out[5] = m.y_axis.z;
-            6
-        }
-    }
-}
-
-/// One driver's residual: the prescribed joint value minus the value the
-/// current state implies. Only the slots that are actual DOF of the joint
-/// kind are accepted (the same contract as [`crate::System::validate`]).
-fn driver_residual(
-    kind: JointKind,
-    slot: DriverSlot,
-    value: f64,
-    p1: DVec3,
-    r1: DQuat,
-    p2: DVec3,
-    r2: DQuat,
-) -> f64 {
-    let r_rel = r1.inverse() * r2;
-    let m = DMat3::from_quat(r_rel);
-    let z1 = r1 * DVec3::Z;
-    let dp = p2 - p1;
-    match (kind, slot) {
-        // Rotation angle about the common Z axis: atan2(R_rel[1][0], R_rel[0][0]).
-        (JointKind::Revolute, DriverSlot::Rotation) => {
-            m.x_axis.y.atan2(m.x_axis.x) - value
-        }
-        (JointKind::Cylindrical, DriverSlot::Rotation) => {
-            m.x_axis.y.atan2(m.x_axis.x) - value
-        }
-        (JointKind::Prismatic, DriverSlot::Translation) => dp.dot(z1) - value,
-        (JointKind::Cylindrical, DriverSlot::Translation) => dp.dot(z1) - value,
-        // A slot that is not a DOF of the kind is rejected by validation; the
-        // residual is never evaluated for it.
-        _ => 0.0,
-    }
-}
-
-/// The kinematic problem at a driver time: the system plus the slot layout,
-/// exposing the residual callback the Newton core consumes.
-struct KinematicProblem<'a> {
+/// The kinematic problem at a driver time: the system plus the slot and
+/// equation layouts.
+struct Problem<'a> {
     sys: &'a System,
     slot_of: BTreeMap<BodyId, usize>,
-    n_eq: usize,
+    /// Tangent column base per slot (`None` = grounded).
+    col_of: Vec<Option<usize>>,
+    n_cols: usize,
+    rows: Vec<EquationRef>,
+    n_joint_rows: usize,
     time: f64,
 }
 
-impl<'a> KinematicProblem<'a> {
+impl<'a> Problem<'a> {
     fn new(sys: &'a System, time: f64) -> Self {
         let mut slot_of = BTreeMap::new();
-        for (slot, id) in sys.bodies.keys().enumerate() {
+        let mut col_of = Vec::with_capacity(sys.bodies.len());
+        let mut n_cols = 0;
+        for (slot, (id, body)) in sys.bodies.iter().enumerate() {
             slot_of.insert(*id, slot);
+            if body.grounded {
+                col_of.push(None);
+            } else {
+                col_of.push(Some(n_cols));
+                n_cols += BODY_TWIST;
+            }
         }
-        Self { sys, slot_of, n_eq: equation_count(sys), time }
+        let rows = constraint_layout(sys);
+        let n_joint_rows = rows
+            .iter()
+            .filter(|r| matches!(r.owner, EquationOwner::Joint(_)))
+            .count();
+        Self { sys, slot_of, col_of, n_cols, rows, n_joint_rows, time }
     }
 
-    fn eval(&self, params: &[f64], out: &mut [f64]) {
-        let mut k = 0;
-        // Per-body unit-norm equations.
-        for slot in 0..self.sys.bodies.len() {
-            let base = slot * BODY_PARAMS;
-            let q = DQuat::from_xyzw(
-                params[base + 3],
-                params[base + 4],
-                params[base + 5],
-                params[base + 6],
-            );
-            out[k] = q.length_squared() - 1.0;
-            k += 1;
+    fn n_bodies(&self) -> usize {
+        self.col_of.len()
+    }
+
+    fn frame(&self, params: &[f64], motion: &[Twist], marker: MarkerId) -> FrameJet {
+        let m = &self.sys.markers[&marker];
+        let slot = self.slot_of[&m.body];
+        let (t, r) = read_pose(params, slot);
+        let body = BodyMotion { t, r, v: motion[slot].linear, w: motion[slot].angular };
+        body.frame(m.translation, m.rotation)
+    }
+
+    /// Every constraint row as a jet along `motion` (zero accelerations):
+    /// joint rows, then the drivers' measured joint coordinates (time terms
+    /// excluded — the callers add them).
+    fn jets(&self, params: &[f64], motion: &[Twist]) -> Vec<Jet> {
+        let mut out = Vec::with_capacity(self.rows.len());
+        let mut buf = [Jet::default(); 6];
+        for joint in self.sys.joints.values().filter(|j| !j.suppressed) {
+            let f1 = self.frame(params, motion, joint.marker1);
+            let f2 = self.frame(params, motion, joint.marker2);
+            let n = joint_rows(joint.kind, &f1, &f2, &mut buf);
+            out.extend_from_slice(&buf[..n]);
         }
-        // Joint equations.
-        for joint in self.sys.joints.values() {
-            if joint.suppressed {
-                continue;
-            }
-            let (p1, r1) = marker_frame(self.sys, &self.slot_of, params, joint.marker1);
-            let (p2, r2) = marker_frame(self.sys, &self.slot_of, params, joint.marker2);
-            k += joint_residuals(joint.kind, p1, r1, p2, r2, &mut out[k..]);
+        for row in &self.rows[self.n_joint_rows..] {
+            let EquationOwner::Driver(index) = row.owner else { continue };
+            let driver = &self.sys.drivers[index];
+            let joint = &self.sys.joints[&driver.joint];
+            let f1 = self.frame(params, motion, joint.marker1);
+            let f2 = self.frame(params, motion, joint.marker2);
+            out.push(joint_coordinate(joint.kind, driver.slot, &f1, &f2).unwrap_or_default());
         }
-        // Driver equations.
-        for driver in &self.sys.drivers {
-            let Some(joint) = self.sys.joints.get(&driver.joint) else {
-                continue;
+        debug_assert_eq!(out.len(), self.rows.len());
+        out
+    }
+
+    /// The constraint residuals at the position level (drivers: measured
+    /// minus prescribed, angles wrapped).
+    fn constraint_residuals(&self, params: &[f64], out: &mut [f64]) {
+        let rest = vec![Twist::default(); self.n_bodies()];
+        let jets = self.jets(params, &rest);
+        for (k, (row, jet)) in self.rows.iter().zip(&jets).enumerate() {
+            out[k] = match row.owner {
+                EquationOwner::Joint(_) => jet.v,
+                EquationOwner::Driver(index) => {
+                    let driver = &self.sys.drivers[index];
+                    let r = jet.v - driver.value_at(self.time);
+                    match driver.slot {
+                        DriverSlot::Rotation => wrap_angle(r),
+                        DriverSlot::Translation => r,
+                    }
+                }
             };
-            if joint.suppressed {
-                continue;
-            }
-            let (p1, r1) = marker_frame(self.sys, &self.slot_of, params, joint.marker1);
-            let (p2, r2) = marker_frame(self.sys, &self.slot_of, params, joint.marker2);
-            let value = driver.value_at(self.time);
-            out[k] = driver_residual(joint.kind, driver.slot, value, p1, r1, p2, r2);
-            k += 1;
         }
-        debug_assert_eq!(k, self.n_eq, "residual count matches the layout");
+    }
+
+    /// The position-IC residual vector: unit-norm rows, then constraints.
+    fn eval(&self, params: &[f64], out: &mut [f64]) {
+        let n = self.n_bodies();
+        for (slot, o) in out.iter_mut().enumerate().take(n) {
+            let base = slot * BODY_PARAMS;
+            let q = DQuat::from_xyzw(params[base + 3], params[base + 4], params[base + 5], params[base + 6]);
+            *o = q.length_squared() - 1.0;
+        }
+        self.constraint_residuals(params, &mut out[n..]);
     }
 
     /// The fixed mask: a grounded body holds all 7 of its slots.
     fn fixed_mask(&self) -> Vec<bool> {
-        let mut fixed = vec![false; self.sys.bodies.len() * BODY_PARAMS];
-        for (id, body) in self.sys.bodies.iter() {
-            if body.grounded {
-                let base = self.slot_of[id] * BODY_PARAMS;
-                for slot in fixed.iter_mut().skip(base).take(BODY_PARAMS) {
-                    *slot = true;
-                }
+        let mut fixed = vec![false; self.n_bodies() * BODY_PARAMS];
+        for (slot, col) in self.col_of.iter().enumerate() {
+            if col.is_none() {
+                fixed[slot * BODY_PARAMS..(slot + 1) * BODY_PARAMS].fill(true);
             }
         }
         fixed
     }
+
+    /// The analytic tangent-space Jacobian (rows × 6·free bodies): column
+    /// `c` is the rate of every row under a unit motion in coordinate `c`.
+    fn jacobian(&self, params: &[f64]) -> Vec<Vec<f64>> {
+        let mut j = vec![vec![0.0; self.n_cols]; self.rows.len()];
+        let mut motion = vec![Twist::default(); self.n_bodies()];
+        for slot in 0..self.n_bodies() {
+            let Some(base) = self.col_of[slot] else { continue };
+            for dir in 0..BODY_TWIST {
+                let mut unit = Twist::default();
+                if dir < 3 {
+                    unit.linear[dir] = 1.0;
+                } else {
+                    unit.angular[dir - 3] = 1.0;
+                }
+                motion[slot] = unit;
+                for (row, jet) in j.iter_mut().zip(self.jets(params, &motion)) {
+                    row[base + dir] = jet.d;
+                }
+            }
+            motion[slot] = Twist::default();
+        }
+        j
+    }
+
+    /// Tangent solution vector → per-slot twists (grounded: zero).
+    fn twists(&self, x: &[f64]) -> Vec<Twist> {
+        self.col_of
+            .iter()
+            .map(|col| match col {
+                None => Twist::default(),
+                Some(b) => Twist {
+                    linear: DVec3::new(x[*b], x[b + 1], x[b + 2]),
+                    angular: DVec3::new(x[b + 3], x[b + 4], x[b + 5]),
+                },
+            })
+            .collect()
+    }
+
+    fn refs(&self, indices: &[usize]) -> Vec<EquationRef> {
+        indices.iter().map(|&k| self.rows[k]).collect()
+    }
+
+    fn diagnose(&self, params: &[f64]) -> KinematicDiagnosis {
+        let j = self.jacobian(params);
+        let mut r = vec![0.0; self.rows.len()];
+        self.constraint_residuals(params, &mut r);
+        let step: Vec<f64> = r.iter().map(|v| -v).collect();
+        let factor = RowFactor::new(&j, self.n_cols);
+        let (_, conflicts) = factor.solve(&step);
+        let mut redundant: Vec<usize> = factor
+            .dependent()
+            .iter()
+            .copied()
+            .filter(|k| !conflicts.contains(k))
+            .collect();
+        redundant.sort_unstable();
+        let joint_rank = RowFactor::new(&j[..self.n_joint_rows], self.n_cols).rank();
+        KinematicDiagnosis {
+            coordinates: self.n_cols,
+            rank: factor.rank(),
+            dof: self.n_cols - factor.rank(),
+            mobility: self.n_cols - joint_rank,
+            redundant: self.refs(&redundant),
+            conflicting: self.refs(&conflicts),
+        }
+    }
+
+    /// Solve one linear level `J x = b`; conflicts are a singular
+    /// configuration.
+    fn solve_level(&self, factor: &RowFactor, b: &[f64], level: &str) -> Result<Vec<Twist>, MbdError> {
+        let (x, conflicts) = factor.solve(b);
+        if !conflicts.is_empty() {
+            return Err(MbdError::new(
+                codes::KINEMATIC_SINGULAR,
+                format!(
+                    "{level} equations inconsistent at t = {}: {}",
+                    self.time,
+                    describe(self.sys, &self.refs(&conflicts))
+                ),
+                "the mechanism is at a lock-up/toggle position, or drivers over-prescribe one degree of freedom",
+            ));
+        }
+        Ok(self.twists(&x))
+    }
+}
+
+/// Human-readable equation list for error details.
+fn describe(sys: &System, refs: &[EquationRef]) -> String {
+    let names: Vec<String> = refs
+        .iter()
+        .map(|r| match r.owner {
+            EquationOwner::Joint(id) => {
+                let name = sys.joints.get(&id).map(|j| j.name.as_str()).unwrap_or("?");
+                format!("joint {} ({name}) row {}", id.0, r.row)
+            }
+            EquationOwner::Driver(i) => {
+                let joint = sys.drivers.get(i).map(|d| d.joint.0).unwrap_or(0);
+                format!("driver #{i} on joint {joint}")
+            }
+        })
+        .collect();
+    names.join(", ")
+}
+
+fn check_state(sys: &System, state: &KinematicState) -> Result<(), MbdError> {
+    if !state.order.iter().eq(sys.bodies.keys()) {
+        return Err(MbdError::new(
+            codes::STATE_MISMATCH,
+            format!(
+                "state holds {} bodies, the system {}; the body ids must match one to one",
+                state.order.len(),
+                sys.bodies.len()
+            ),
+            "seed from a state solved for this same system (or KinematicState::from_system)",
+        ));
+    }
+    Ok(())
 }
 
 /// Solve the position initial condition at a driver time: the per-body poses
@@ -319,27 +459,151 @@ impl<'a> KinematicProblem<'a> {
 /// system's authored poses.
 ///
 /// The solve is a damped Newton-Raphson on the shared `rcad-gcs` numerics
-/// core (central-difference Jacobian). Failure to converge is data
-/// ([`codes::KINEMATICS_NOT_CONVERGED`]), never a panic.
+/// core. Failure to converge is data ([`codes::KINEMATICS_NOT_CONVERGED`],
+/// naming the conflicting equations when the linearization shows any),
+/// never a panic. Free degrees of freedom are allowed (an assembly solve).
 pub fn position_ic(sys: &System, time: f64) -> Result<KinematicState, MbdError> {
     sys.validate()?;
-    let problem = KinematicProblem::new(sys, time);
-    let mut state = KinematicState::from_system(sys);
+    solve_position(sys, time, KinematicState::from_system(sys))
+}
+
+/// [`position_ic`] from a caller-supplied seed (the previous instant of a
+/// sweep, or a dragged configuration). Grounded bodies are reset to their
+/// authored poses.
+pub fn position_ic_from(sys: &System, time: f64, seed: &KinematicState) -> Result<KinematicState, MbdError> {
+    sys.validate()?;
+    check_state(sys, seed)?;
+    let mut state = seed.clone();
+    for (id, body) in &sys.bodies {
+        if body.grounded {
+            state.set_body_pose(*id, body.translation, body.rotation);
+        }
+    }
+    solve_position(sys, time, state)
+}
+
+fn solve_position(sys: &System, time: f64, mut state: KinematicState) -> Result<KinematicState, MbdError> {
+    let problem = Problem::new(sys, time);
     let fixed = problem.fixed_mask();
+    let n_eq = problem.n_bodies() + problem.rows.len();
     let GcsSolveResult { converged, residual, iterations } =
-        newton_solve(&mut state.params, &fixed, problem.n_eq, |p, out| {
-            problem.eval(p, out);
-        });
+        newton_solve(&mut state.params, &fixed, n_eq, |p, out| problem.eval(p, out));
     if !converged {
+        let diagnosis = problem.diagnose(&state.params);
+        let conflicts = if diagnosis.conflicting.is_empty() {
+            String::new()
+        } else {
+            format!("; conflicting: {}", describe(sys, &diagnosis.conflicting))
+        };
         return Err(MbdError::new(
             codes::KINEMATICS_NOT_CONVERGED,
             format!(
-                "position IC did not converge: rms residual {residual:.3e} after {iterations} iterations"
+                "position IC at t = {time} did not converge: rms residual {residual:.3e} after {iterations} iterations{conflicts}"
             ),
             "check the joint layout for over-constraint, or seed the bodies closer to a valid configuration",
         ));
     }
+    state.normalize_quaternions();
     Ok(state)
+}
+
+/// The rank analysis of the constraint equations at `state`: degrees of
+/// freedom, mobility, redundant and conflicting equations.
+pub fn diagnose(sys: &System, state: &KinematicState, time: f64) -> Result<KinematicDiagnosis, MbdError> {
+    sys.validate()?;
+    check_state(sys, state)?;
+    Ok(Problem::new(sys, time).diagnose(&state.params))
+}
+
+/// Solve one instant on all three levels: position (from `seed`, or the
+/// authored poses), then velocity `J·q̇ = ṡ` and acceleration `J·q̈ = s̈ − γ`
+/// (`s` the driver profiles, `γ` the velocity-quadratic term).
+///
+/// The velocity and acceleration levels need a fully prescribed mechanism:
+/// free degrees of freedom left after the drivers are
+/// [`codes::UNDERDETERMINED_MOTION`]; inconsistent levels (a toggle
+/// position) are [`codes::KINEMATIC_SINGULAR`]. Redundant equations are
+/// skipped and listed in the frame.
+pub fn solve_frame(sys: &System, time: f64, seed: Option<&KinematicState>) -> Result<KinematicFrame, MbdError> {
+    let state = match seed {
+        Some(seed) => position_ic_from(sys, time, seed)?,
+        None => position_ic(sys, time)?,
+    };
+    let problem = Problem::new(sys, time);
+    let j = problem.jacobian(&state.params);
+    let factor = RowFactor::new(&j, problem.n_cols);
+    if factor.rank() < problem.n_cols {
+        let free = problem.n_cols - factor.rank();
+        return Err(MbdError::new(
+            codes::UNDERDETERMINED_MOTION,
+            format!("the mechanism keeps {free} free degree(s) of freedom at t = {time} after its drivers"),
+            "a kinematic analysis needs every degree of freedom prescribed: add drivers (or run dynamics, M2)",
+        ));
+    }
+    let samples: Vec<_> = problem
+        .rows
+        .iter()
+        .map(|r| match r.owner {
+            EquationOwner::Driver(i) => Some(sys.drivers[i].sample(time)),
+            EquationOwner::Joint(_) => None,
+        })
+        .collect();
+    let b_vel: Vec<f64> = samples.iter().map(|s| s.map_or(0.0, |s| s.velocity)).collect();
+    let velocity = problem.solve_level(&factor, &b_vel, "velocity")?;
+    let jets = problem.jets(&state.params, &velocity);
+    let b_acc: Vec<f64> = samples
+        .iter()
+        .zip(&jets)
+        .map(|(s, jet)| s.map_or(0.0, |s| s.acceleration) - jet.dd)
+        .collect();
+    let acceleration = problem.solve_level(&factor, &b_acc, "acceleration")?;
+    let mut redundant: Vec<usize> = factor.dependent().to_vec();
+    redundant.sort_unstable();
+    Ok(KinematicFrame {
+        time,
+        velocity: state.order.iter().copied().zip(velocity).collect(),
+        acceleration: state.order.iter().copied().zip(acceleration).collect(),
+        redundant: problem.refs(&redundant),
+        state,
+    })
+}
+
+/// Run the kinematic analysis over a time grid (finite, non-decreasing).
+/// Each instant is seeded from the previous one advanced by its velocity
+/// and acceleration, so the solution stays on one assembly branch and a
+/// motor's angle runs on continuously. An error names the instant it
+/// stopped at.
+pub fn kinematic_sweep(sys: &System, times: &[f64]) -> Result<Vec<KinematicFrame>, MbdError> {
+    if times.iter().any(|t| !t.is_finite()) || times.windows(2).any(|w| w[1] < w[0]) {
+        return Err(MbdError::new(
+            codes::BAD_TIME_GRID,
+            "the time grid must be finite and non-decreasing",
+            "pass output times in ascending order",
+        ));
+    }
+    let mut frames: Vec<KinematicFrame> = Vec::with_capacity(times.len());
+    for &time in times {
+        let seed = frames.last().map(|prev| predict(prev, time));
+        let frame = solve_frame(sys, time, seed.as_ref())?;
+        frames.push(frame);
+    }
+    Ok(frames)
+}
+
+/// Second-order Taylor predictor from a solved frame to `time`.
+fn predict(prev: &KinematicFrame, time: f64) -> KinematicState {
+    let dt = time - prev.time;
+    let mut state = prev.state.clone();
+    for id in prev.state.order.clone() {
+        let (t, r) = prev.state.body_pose(id).expect("own body");
+        let v = prev.velocity[&id];
+        let a = prev.acceleration[&id];
+        let t = t + v.linear * dt + 0.5 * a.linear * dt * dt;
+        let turn = v.angular * dt + 0.5 * a.angular * dt * dt;
+        let r = DQuat::from_scaled_axis(turn) * r;
+        state.set_body_pose(id, t, r);
+    }
+    state
 }
 
 #[cfg(test)]
@@ -347,8 +611,9 @@ mod tests {
     use super::*;
     use crate::body::Body;
     use crate::force::ForceElement;
-    use crate::joint::{Driver, DriverProfile, Joint};
+    use crate::joint::{Driver, DriverProfile, Joint, JointKind};
     use crate::{BodyId, ForceId, JointId, Marker, MarkerId};
+    use glam::DMat3;
 
     fn grounded_base() -> Body {
         Body {
@@ -363,10 +628,9 @@ mod tests {
         }
     }
 
-    /// A grounded base plus one link on a revolute hinge at the origin, with
-    /// a constant-rate driver. The link's authored pose already satisfies
-    /// the joint; the driver value is what the position IC must hold.
-    fn hinge(driver_angle: f64) -> System {
+    /// A grounded base plus one link on a joint at the origin, with a
+    /// constant-rate driver on `slot`.
+    fn one_joint(kind: JointKind, slot: DriverSlot, start: f64, rate: f64) -> System {
         let mut sys = System::new("hinge");
         sys.add_body(grounded_base()).unwrap();
         sys.add_body(Body {
@@ -393,7 +657,7 @@ mod tests {
         sys.add_joint(Joint {
             id: JointId(1),
             name: "hinge".into(),
-            kind: JointKind::Revolute,
+            kind,
             marker1: MarkerId(1),
             marker2: MarkerId(2),
             suppressed: false,
@@ -401,13 +665,19 @@ mod tests {
         .unwrap();
         sys.add_driver(Driver {
             joint: JointId(1),
-            slot: DriverSlot::Rotation,
-            profile: DriverProfile::Constant {
-                start: driver_angle,
-                rate: 0.0,
-            },
+            slot,
+            profile: DriverProfile::Constant { start, rate },
         });
         sys
+    }
+
+    fn hinge(driver_angle: f64) -> System {
+        one_joint(JointKind::Revolute, DriverSlot::Rotation, driver_angle, 0.0)
+    }
+
+    fn hinge_angle(state: &KinematicState) -> f64 {
+        let (_, r) = state.body_pose(BodyId(2)).unwrap();
+        2.0 * r.z.atan2(r.w)
     }
 
     /// The residual layout matches the equation count, and a valid
@@ -416,8 +686,8 @@ mod tests {
     fn residual_layout_is_consistent() {
         let sys = hinge(0.0);
         assert_eq!(equation_count(&sys), 2 + 5 + 1);
-        let problem = KinematicProblem::new(&sys, 0.0);
-        let mut out = vec![0.0; problem.n_eq];
+        let problem = Problem::new(&sys, 0.0);
+        let mut out = vec![0.0; equation_count(&sys)];
         let state = KinematicState::from_system(&sys);
         problem.eval(state.params(), &mut out);
         for (i, r) in out.iter().enumerate() {
@@ -437,22 +707,60 @@ mod tests {
             assert!(t.length() < 1e-9, "origin coincidence held: {t:?}");
             let z = r * DVec3::Z;
             assert!(z.dot(DVec3::Z) > 1.0 - 1e-9, "axis stayed parallel");
-            let theta = 2.0 * r.z.atan2(r.w);
-            assert!(
-                (theta - angle).abs() < 1e-9,
-                "driver angle {angle} held, got {theta}"
-            );
+            let theta = hinge_angle(&state);
+            assert!((theta - angle).abs() < 1e-9, "driver angle {angle} held, got {theta}");
         }
     }
 
-    /// The validation gate rejects a driver slot that is not a DOF of the
-    /// joint before any solve runs.
+    /// A driver angle beyond ±π (a motor past half a turn) converges to the
+    /// same pose modulo a full turn.
     #[test]
-    fn bad_driver_slot_is_rejected_before_solving() {
-        let mut sys = hinge(0.0);
-        sys.drivers[0].slot = DriverSlot::Translation;
-        let err = position_ic(&sys, 0.0).unwrap_err();
-        assert_eq!(err.code, codes::SLOT_UNSUPPORTED);
+    fn driver_angle_past_half_a_turn_converges() {
+        for angle in [4.0, -4.0, 7.5, 20.0] {
+            let state = position_ic(&hinge(angle), 0.0).expect("converges");
+            let off = wrap_angle(hinge_angle(&state) - angle);
+            assert!(off.abs() < 1e-9, "angle {angle}: off by {off}");
+        }
+    }
+
+    /// A seeded solve starts from the seed (and resets grounded bodies);
+    /// a seed from another system is rejected.
+    #[test]
+    fn seeded_position_ic() {
+        let sys = hinge(1.0);
+        let solved = position_ic(&sys, 0.0).unwrap();
+        let mut moved = solved.clone();
+        moved.set_body_pose(BodyId(1), DVec3::X, DQuat::IDENTITY);
+        let again = position_ic_from(&sys, 0.0, &moved).unwrap();
+        assert_eq!(again.body_pose(BodyId(1)).unwrap().0, DVec3::ZERO);
+        assert!((hinge_angle(&again) - 1.0).abs() < 1e-9);
+        let mut other = System::new("other");
+        other.add_body(grounded_base()).unwrap();
+        assert_eq!(
+            position_ic_from(&other, 0.0, &solved).unwrap_err().code,
+            codes::STATE_MISMATCH
+        );
+    }
+
+    /// Planar rotation drives (the angle about the common normal); planar
+    /// translation and universal rotation have no single slot and are
+    /// rejected before any solve.
+    #[test]
+    fn drivable_slots() {
+        let sys = one_joint(JointKind::Planar, DriverSlot::Rotation, 0.7, 0.0);
+        let state = position_ic(&sys, 0.0).expect("planar rotation drives");
+        assert!((hinge_angle(&state) - 0.7).abs() < 1e-9);
+        for (kind, slot) in [
+            (JointKind::Planar, DriverSlot::Translation),
+            (JointKind::Universal, DriverSlot::Rotation),
+            (JointKind::Revolute, DriverSlot::Translation),
+        ] {
+            let err = position_ic(&one_joint(kind, slot, 0.0, 0.0), 0.0).unwrap_err();
+            assert_eq!(err.code, codes::SLOT_UNSUPPORTED, "{kind:?} {slot:?}");
+        }
+        let mut twice = hinge(0.0);
+        twice.add_driver(twice.drivers[0].clone());
+        assert_eq!(twice.validate().unwrap_err().code, codes::DUPLICATE_DRIVER);
     }
 
     /// A suppressed joint drops its equations (and its driver's) from the
@@ -465,8 +773,7 @@ mod tests {
         assert_eq!(equation_count(&sys), 2, "only the two unit-norm equations remain");
     }
 
-    /// The force vocabulary is untouched by the kinematic slice (the M0
-    /// tables stay valid next to the new module).
+    /// The force vocabulary is untouched by the kinematic slice.
     #[test]
     fn force_tables_still_validate() {
         let mut sys = hinge(0.0);
@@ -481,5 +788,102 @@ mod tests {
         })
         .unwrap();
         assert!(sys.validate().is_ok());
+    }
+
+    /// The jets' first and second derivatives agree with finite differences
+    /// of the residual values along a constant-twist motion — for every joint
+    /// kind and both driver coordinates, at a generic configuration.
+    #[test]
+    fn jets_match_finite_differences() {
+        let q1 = DQuat::from_euler(glam::EulerRot::XYZ, 0.3, -0.7, 1.1);
+        let q2 = DQuat::from_euler(glam::EulerRot::XYZ, -0.4, 0.2, 2.3);
+        let m1 = (DVec3::new(0.1, -0.2, 0.3), DQuat::from_euler(glam::EulerRot::XYZ, 0.5, 0.1, -0.3));
+        let m2 = (DVec3::new(-0.3, 0.05, 0.2), DQuat::from_euler(glam::EulerRot::XYZ, -0.2, 0.6, 0.4));
+        let body1 = BodyMotion {
+            t: DVec3::new(0.2, 0.1, -0.1),
+            r: q1,
+            v: DVec3::new(0.3, -0.5, 0.2),
+            w: DVec3::new(1.1, 0.4, -0.7),
+        };
+        let body2 = BodyMotion {
+            t: DVec3::new(-0.1, 0.4, 0.3),
+            r: q2,
+            v: DVec3::new(-0.2, 0.6, 0.1),
+            w: DVec3::new(-0.3, 0.9, 1.4),
+        };
+        let at = |b: &BodyMotion, h: f64| BodyMotion {
+            t: b.t + b.v * h,
+            r: DQuat::from_scaled_axis(b.w * h) * b.r,
+            v: DVec3::ZERO,
+            w: DVec3::ZERO,
+        };
+        let rows = |b1: &BodyMotion, b2: &BodyMotion, kind: JointKind| {
+            let f1 = b1.frame(m1.0, m1.1);
+            let f2 = b2.frame(m2.0, m2.1);
+            let mut buf = [Jet::default(); 6];
+            let n = joint_rows(kind, &f1, &f2, &mut buf);
+            let mut out = buf[..n].to_vec();
+            for slot in [DriverSlot::Rotation, DriverSlot::Translation] {
+                if let Some(j) = joint_coordinate(JointKind::Cylindrical, slot, &f1, &f2) {
+                    out.push(j);
+                }
+            }
+            out
+        };
+        let h = 1e-4;
+        for kind in [
+            JointKind::Revolute,
+            JointKind::Prismatic,
+            JointKind::Cylindrical,
+            JointKind::Spherical,
+            JointKind::Planar,
+            JointKind::Universal,
+            JointKind::Fixed,
+        ] {
+            let jets = rows(&body1, &body2, kind);
+            let ahead = rows(&at(&body1, h), &at(&body2, h), kind);
+            let here = rows(&at(&body1, 0.0), &at(&body2, 0.0), kind);
+            let behind = rows(&at(&body1, -h), &at(&body2, -h), kind);
+            for k in 0..jets.len() {
+                assert!((here[k].v - jets[k].v).abs() < 1e-12);
+                let d = (ahead[k].v - behind[k].v) / (2.0 * h);
+                let dd = (ahead[k].v - 2.0 * here[k].v + behind[k].v) / (h * h);
+                assert!((d - jets[k].d).abs() < 1e-6, "{kind:?} row {k}: d {d} vs {}", jets[k].d);
+                assert!((dd - jets[k].dd).abs() < 1e-4, "{kind:?} row {k}: dd {dd} vs {}", jets[k].dd);
+            }
+        }
+    }
+
+    /// The hinge's velocity and acceleration levels reproduce the driver
+    /// rate and acceleration, and a hinge without its driver is reported as
+    /// underdetermined (mobility 1).
+    #[test]
+    fn hinge_velocity_and_acceleration_levels() {
+        let mut sys = one_joint(JointKind::Revolute, DriverSlot::Rotation, 0.0, 0.0);
+        sys.drivers[0].profile = DriverProfile::Harmonic {
+            offset: 0.2,
+            amplitude: 0.5,
+            frequency_hz: 0.8,
+            phase: 0.1,
+        };
+        let t = 0.37;
+        let frame = solve_frame(&sys, t, None).unwrap();
+        let s = sys.drivers[0].sample(t);
+        let v = frame.velocity[&BodyId(2)];
+        let a = frame.acceleration[&BodyId(2)];
+        assert!((v.angular - DVec3::Z * s.velocity).length() < 1e-9, "{v:?}");
+        assert!(v.linear.length() < 1e-9);
+        assert!((a.angular - DVec3::Z * s.acceleration).length() < 1e-9, "{a:?}");
+        assert!(frame.redundant.is_empty());
+
+        let mut free = sys.clone();
+        free.drivers.clear();
+        let state = position_ic(&free, 0.0).unwrap();
+        let diag = diagnose(&free, &state, 0.0).unwrap();
+        assert_eq!((diag.coordinates, diag.rank, diag.dof, diag.mobility), (6, 5, 1, 1));
+        assert_eq!(
+            solve_frame(&free, 0.0, None).unwrap_err().code,
+            codes::UNDERDETERMINED_MOTION
+        );
     }
 }
