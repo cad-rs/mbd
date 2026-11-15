@@ -12,6 +12,25 @@
 
 ## Unreleased (M1 + M1.5 + M2 + M3 + M4 complete, performance channel, Tier C)
 
+### Code review — deduplication and simplification
+
+- API: `write_mjcf(sys)` takes no options (`MjcfOptions` removed; the
+  timestep 0.1 ms and RK4 were its only settings). `DEFAULT_ERROR_TOL` is
+  re-exported next to `DEFAULT_ALPHA`.
+- One copy of each solver helper (pose retraction, driver levels,
+  acceleration right side, tangent-vector conversions, max norm, dense
+  saddle assembly); one frame builder and one saddle solve in dynamics;
+  the integrator's Newton loop reuses the residual a fresh matrix was
+  built at; a dead loop in the sparse ordering removed; reactions resolve
+  each owner's markers once.
+- Fix: a fixed-step simulation no longer keeps the halved step after a
+  Newton failure (the no-growth-after-reject rule now applies to error
+  control only).
+- Tests: shared builders in `tests/common`, duplicate checks of the same
+  system merged, calibration prints and stale tests removed (93 tests).
+- Outputs bit-identical to before (Tier B/C trajectories, integrator
+  statistics, reactions, statics, diagnostics, MJCF / asmt / CSV exports).
+
 ### Tier C — MuJoCo cross-check
 
 - `mjcf` module: `write_mjcf(sys)` (RK4 at 0.1 ms) — tree mechanisms

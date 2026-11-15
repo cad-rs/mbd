@@ -54,7 +54,9 @@ pub use dynamics::{
 };
 pub use error::{codes, MbdError};
 pub use force::{Argument, ForceElement, ForceId, Function};
-pub use integrate::{simulate, HhtSettings, IntegrationStats, Simulation, DEFAULT_ALPHA};
+pub use integrate::{
+    simulate, HhtSettings, IntegrationStats, Simulation, DEFAULT_ALPHA, DEFAULT_ERROR_TOL,
+};
 pub use joint::{Joint, JointId, JointKind};
 pub use kinematics::{
     diagnose, equation_count, kinematic_sweep, position_ic, position_ic_from, solve_frame,
