@@ -5,6 +5,9 @@
 //! Grübler counts −2 DOF, the true mobility is 1, so the solver must find
 //! and skip exactly three redundant equations.
 
+mod common;
+
+use common::{grid, joint, marker};
 use glam::{DMat3, DQuat, DVec3};
 use rcad_mbd::*;
 
@@ -25,34 +28,6 @@ fn body(id: u64, name: &str, at: DVec3, grounded: bool) -> Body {
         velocity: DVec3::ZERO,
         angular_velocity: DVec3::ZERO,
     }
-}
-
-fn marker(sys: &mut System, id: u64, body: u64, at: DVec3, rotation: DQuat) {
-    sys.add_marker(Marker {
-        id: MarkerId(id),
-        name: format!("m{id}"),
-        body: BodyId(body),
-        translation: at,
-        rotation,
-    })
-    .unwrap();
-}
-
-fn joint(sys: &mut System, id: u64, kind: JointKind, m1: u64, m2: u64) {
-    sys.add_joint(Joint {
-        id: JointId(id),
-        name: format!("j{id}"),
-        kind,
-        marker1: MarkerId(m1),
-        marker2: MarkerId(m2),
-        suppressed: false,
-    })
-    .unwrap();
-}
-
-fn grid(end: f64, step: f64) -> Vec<f64> {
-    let n = (end / step).round() as usize;
-    (0..=n).map(|k| k as f64 * step).collect()
 }
 
 // ── crank-slider ────────────────────────────────────────────────────────

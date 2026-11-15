@@ -13,8 +13,6 @@
 
 #![allow(dead_code)]
 
-use std::collections::BTreeMap;
-
 use glam::{DMat3, DQuat, DVec3};
 use rcad_mbd::*;
 
@@ -268,17 +266,11 @@ pub fn run() -> Result<(System, Lookup, StudyResult), MbdError> {
 fn main() {
     match run() {
         Ok((_, lookup, result)) => {
-            let names: BTreeMap<_, _> = lookup
-                .joint_of_mate
-                .iter()
-                .enumerate()
-                .map(|(i, j)| (*j, i))
-                .collect();
             eprintln!(
-                "{} frames, {} redundant equations; joints: {:?}",
+                "{} frames, {} redundant equations; joint of each mate: {:?}",
                 result.frames.len(),
                 result.redundant.len(),
-                names
+                lookup.joint_of_mate
             );
             print!("{}", result.to_csv());
         }

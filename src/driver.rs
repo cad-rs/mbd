@@ -327,9 +327,6 @@ mod tests {
             assert!(profile.check().is_ok());
             for k in 1..40 {
                 let t = 0.05 * k as f64 + 0.013;
-                if t >= 1.99 {
-                    continue;
-                }
                 let s = profile.sample(t);
                 let ahead = profile.sample(t + h);
                 let behind = profile.sample(t - h);

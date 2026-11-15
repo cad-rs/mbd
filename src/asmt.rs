@@ -390,6 +390,12 @@ fn vector(v: DVec3) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const SIM: AsmtSimulation = AsmtSimulation {
+        tstart: 0.0,
+        tend: 1.0,
+        hout: 0.1,
+    };
     use crate::body::{BodyId, Marker, MarkerId};
     use crate::driver::Driver;
     use crate::joint::{Joint, JointId};
@@ -443,12 +449,7 @@ mod tests {
     /// the grounding fixed joint, the joint and the motion expression.
     #[test]
     fn hinge_exports_the_expected_sections() {
-        let sim = AsmtSimulation {
-            tstart: 0.0,
-            tend: 1.0,
-            hout: 0.1,
-        };
-        let text = write_asmt(&hinge(), &sim).unwrap();
+        let text = write_asmt(&hinge(), &SIM).unwrap();
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(&lines[..2], &["OndselSolver", "Assembly"]);
         for section in [
@@ -470,7 +471,7 @@ mod tests {
         assert!(text.contains("\t\t\tRevoluteJoint\n\t\t\t\tName\n\t\t\t\t\tj1\n\t\t\t\tMarkerI\n\t\t\t\t\t/Assembly/b1/m1\n\t\t\t\tMarkerJ\n\t\t\t\t\t/Assembly/b2/m2\n"));
         assert!(text.contains("\t\t\t\tRotationZ\n\t\t\t\t\t0.25 - 2*time\n"));
         assert!(text.contains("\t\tnframe\n\t\t\t11\n"));
-        assert_eq!(text, write_asmt(&hinge(), &sim).unwrap(), "deterministic");
+        assert_eq!(text, write_asmt(&hinge(), &SIM).unwrap(), "deterministic");
     }
 
     /// A joint driven in rotation and translation gives the rotation motion
@@ -478,11 +479,6 @@ mod tests {
     /// I marker overwrite the earlier one); the translation keeps the joint.
     #[test]
     fn doubly_driven_joint_aliases_the_rotation_marker() {
-        let sim = AsmtSimulation {
-            tstart: 0.0,
-            tend: 1.0,
-            hout: 0.1,
-        };
         let mut sys = hinge();
         sys.joints.get_mut(&JointId(1)).unwrap().kind = JointKind::Cylindrical;
         sys.add_driver(Driver {
@@ -493,7 +489,7 @@ mod tests {
                 rate: 0.5,
             },
         });
-        let text = write_asmt(&sys, &sim).unwrap();
+        let text = write_asmt(&sys, &SIM).unwrap();
         assert!(
             text.contains("\t\t\t\t\t\t\t\tm1d0\n"),
             "alias marker on the ground part"
@@ -505,7 +501,7 @@ mod tests {
             "\t\t\tTranslationalMotion\n\t\t\t\tName\n\t\t\t\t\td1\n\t\t\t\tMotionJoint\n\t\t\t\t\t/Assembly/j1\n"
         ));
         assert!(
-            !write_asmt(&hinge(), &sim).unwrap().contains("m1d0"),
+            !write_asmt(&hinge(), &SIM).unwrap().contains("m1d0"),
             "single driver: no alias"
         );
     }
@@ -513,11 +509,6 @@ mod tests {
     /// Profiles without an expression and non-diagonal inertia are refused.
     #[test]
     fn unsupported_inputs_are_refused() {
-        let sim = AsmtSimulation {
-            tstart: 0.0,
-            tend: 1.0,
-            hout: 0.1,
-        };
         let mut sys = hinge();
         sys.drivers[0].profile = DriverProfile::Step5 {
             t0: 0.0,
@@ -526,13 +517,13 @@ mod tests {
             v1: 1.0,
         };
         assert_eq!(
-            write_asmt(&sys, &sim).unwrap_err().code,
+            write_asmt(&sys, &SIM).unwrap_err().code,
             codes::ASMT_UNSUPPORTED
         );
         let mut sys = hinge();
         sys.bodies.get_mut(&BodyId(2)).unwrap().inertia_com.x_axis.y = 0.01;
         assert_eq!(
-            write_asmt(&sys, &sim).unwrap_err().code,
+            write_asmt(&sys, &SIM).unwrap_err().code,
             codes::ASMT_UNSUPPORTED
         );
     }

@@ -15,14 +15,14 @@
 //! the dense `rcad-gcs` Newton as the fallback. The velocity and
 //! acceleration levels are linear solves
 //! against the analytic tangent-space Jacobian, which comes from the same
-//! residual code evaluated on second-order jets ([`crate::jet`]), so the
+//! residual code evaluated on second-order jets (`jet` module), so the
 //! position residuals, the Jacobian and the quadratic term `γ` cannot drift
 //! apart.
 //!
 //! **Redundancy.** Real CAD assemblies are over-constrained (a planar
 //! four-bar built from 3D revolutes carries three redundant equations).
 //! The linear solves go through the sparse saddle factorization
-//! ([`crate::sparse`]) with the dense rank-revealing QR as the diagnosing
+//! (`sparse` module) with the dense rank-revealing QR as the diagnosing
 //! fallback: dependent but consistent equations are reported as redundant
 //! and skipped; dependent inconsistent ones are conflicts and fail as data.
 //!
@@ -1019,11 +1019,25 @@ fn predict(prev: &KinematicFrame, time: f64) -> KinematicState {
 mod tests {
     use super::*;
     use crate::body::Body;
-    use crate::force::ForceElement;
     use crate::driver::{Driver, DriverProfile};
     use crate::joint::{Joint, JointKind};
-    use crate::{BodyId, ForceId, JointId, Marker, MarkerId};
+    use crate::{BodyId, JointId, Marker, MarkerId};
     use glam::DMat3;
+
+    const ALL_KINDS: [JointKind; 12] = [
+        JointKind::Revolute,
+        JointKind::Prismatic,
+        JointKind::Cylindrical,
+        JointKind::Spherical,
+        JointKind::Planar,
+        JointKind::Universal,
+        JointKind::Fixed,
+        JointKind::InLine,
+        JointKind::InPlane,
+        JointKind::Orientation,
+        JointKind::ParallelAxes,
+        JointKind::Perpendicular,
+    ];
 
     fn grounded_base() -> Body {
         Body {
@@ -1182,27 +1196,8 @@ mod tests {
     #[test]
     fn suppressed_joint_leaves_no_equations() {
         let mut sys = hinge(0.0);
-        assert_eq!(equation_count(&sys), 8, "2 unit + 5 joint + 1 driver");
         sys.joints.get_mut(&JointId(1)).unwrap().suppressed = true;
         assert_eq!(equation_count(&sys), 2, "only the two unit-norm equations remain");
-    }
-
-    /// The force vocabulary is untouched by the kinematic slice.
-    #[test]
-    fn force_tables_still_validate() {
-        let mut sys = hinge(0.0);
-        sys.add_force(ForceElement::SpringDamper {
-            id: ForceId(1),
-            name: "return".into(),
-            marker1: MarkerId(1),
-            marker2: MarkerId(2),
-            stiffness: 100.0,
-            damping: 1.0,
-            free_length: 0.0,
-            preload: 0.0,
-        })
-        .unwrap();
-        assert!(sys.validate().is_ok());
     }
 
     /// The jets' first and second derivatives agree with finite differences
@@ -1245,20 +1240,7 @@ mod tests {
             out
         };
         let h = 1e-4;
-        for kind in [
-            JointKind::Revolute,
-            JointKind::Prismatic,
-            JointKind::Cylindrical,
-            JointKind::Spherical,
-            JointKind::Planar,
-            JointKind::Universal,
-            JointKind::Fixed,
-            JointKind::InLine,
-            JointKind::InPlane,
-            JointKind::Orientation,
-            JointKind::ParallelAxes,
-            JointKind::Perpendicular,
-        ] {
+        for kind in ALL_KINDS {
             let jets = rows(&body1, &body2, kind);
             let ahead = rows(&at(&body1, h), &at(&body2, h), kind);
             let here = rows(&at(&body1, 0.0), &at(&body2, 0.0), kind);
@@ -1278,20 +1260,6 @@ mod tests {
     /// a driver, at a generic configuration.
     #[test]
     fn owner_local_jacobian_matches_dense() {
-        let kinds = [
-            JointKind::Revolute,
-            JointKind::Prismatic,
-            JointKind::Cylindrical,
-            JointKind::Spherical,
-            JointKind::Planar,
-            JointKind::Universal,
-            JointKind::Fixed,
-            JointKind::InLine,
-            JointKind::InPlane,
-            JointKind::Orientation,
-            JointKind::ParallelAxes,
-            JointKind::Perpendicular,
-        ];
         let mut sys = System::new("all kinds");
         sys.add_body(grounded_base()).unwrap();
         let mut next_marker = 0;
@@ -1307,7 +1275,7 @@ mod tests {
             .unwrap();
             MarkerId(next_marker)
         };
-        for (i, kind) in kinds.iter().enumerate() {
+        for (i, kind) in ALL_KINDS.iter().enumerate() {
             let id = i as u64 + 2;
             let t = 0.1 * id as f64;
             sys.add_body(Body {

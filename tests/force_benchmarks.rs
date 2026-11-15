@@ -2,104 +2,24 @@
 //! (time and state curves), follower loads, line forces, preloads and the
 //! work-energy audit, against closed forms.
 
-use glam::{DMat3, DQuat, DVec3};
+mod common;
+
+use common::*;
+use glam::{DQuat, DVec3};
 use rcad_mbd::*;
 
-const G: f64 = STANDARD_GRAVITY;
-const M: f64 = 2.0;
-const L: f64 = 0.6;
-const IZZ: f64 = 0.03;
 const K: f64 = 400.0;
 const FREE: f64 = 0.25;
-
-fn ground() -> Body {
-    Body {
-        id: BodyId(1),
-        name: "ground".into(),
-        mass_kg: 0.0,
-        com: DVec3::ZERO,
-        inertia_com: DMat3::ZERO,
-        translation: DVec3::ZERO,
-        rotation: DQuat::IDENTITY,
-        grounded: true,
-        velocity: DVec3::ZERO,
-        angular_velocity: DVec3::ZERO,
-    }
-}
-
-fn part(com: DVec3, at: DVec3, rotation: DQuat) -> Body {
-    Body {
-        id: BodyId(2),
-        name: "part".into(),
-        mass_kg: M,
-        com,
-        inertia_com: DMat3::from_diagonal(DVec3::new(0.04, 0.01, IZZ)),
-        translation: at,
-        rotation,
-        grounded: false,
-        velocity: DVec3::ZERO,
-        angular_velocity: DVec3::ZERO,
-    }
-}
-
-fn marker(sys: &mut System, id: u64, body: u64, at: DVec3, rotation: DQuat) {
-    sys.add_marker(Marker {
-        id: MarkerId(id),
-        name: format!("m{id}"),
-        body: BodyId(body),
-        translation: at,
-        rotation,
-    })
-    .unwrap();
-}
-
-fn joint(sys: &mut System, kind: JointKind) {
-    sys.add_joint(Joint {
-        id: JointId(1),
-        name: "j1".into(),
-        kind,
-        marker1: MarkerId(1),
-        marker2: MarkerId(2),
-        suppressed: false,
-    })
-    .unwrap();
-}
 
 fn add(sys: &mut System, element: ForceElement) {
     sys.add_force(element).unwrap();
 }
 
-fn grid(end: f64, step: f64) -> Vec<f64> {
-    let n = (end / step).round() as usize;
-    (0..=n).map(|k| k as f64 * step).collect()
-}
-
-fn close(a: f64, b: f64, tol: f64, what: &str) {
-    assert!((a - b).abs() <= tol * (1.0 + b.abs()), "{what}: {a} vs {b}");
-}
-
-/// Compound pendulum: hinge about world Z at the origin, center of mass
-/// `L` below it, gravity −Y, authored at hinge angle `theta`.
-fn pendulum(theta: f64, gravity: bool) -> System {
-    let mut sys = System::new("pendulum");
-    if gravity {
-        sys.gravity = Some(DVec3::new(0.0, -G, 0.0));
-    }
-    sys.add_body(ground()).unwrap();
-    sys.add_body(part(
-        DVec3::new(0.0, -L, 0.0),
-        DVec3::ZERO,
-        DQuat::from_rotation_z(theta),
-    ))
-    .unwrap();
-    marker(&mut sys, 1, 1, DVec3::ZERO, DQuat::IDENTITY);
-    marker(&mut sys, 2, 2, DVec3::ZERO, DQuat::IDENTITY);
-    joint(&mut sys, JointKind::Revolute);
+/// The pendulum without gravity.
+fn weightless(theta: f64) -> System {
+    let mut sys = pendulum(theta);
+    sys.gravity = None;
     sys
-}
-
-fn i_hinge() -> f64 {
-    IZZ + M * L * L
 }
 
 /// A slider on a prismatic joint along world X, no load across the slide
@@ -108,12 +28,12 @@ fn slider(x: f64) -> System {
     let mut sys = System::new("slider");
     sys.gravity = Some(DVec3::new(0.0, -G, 0.0));
     sys.add_body(ground()).unwrap();
-    sys.add_body(part(DVec3::ZERO, DVec3::new(x, 0.0, 0.0), DQuat::IDENTITY))
+    sys.add_body(link(DVec3::ZERO, DVec3::new(x, 0.0, 0.0), DQuat::IDENTITY))
         .unwrap();
     let along_x = DQuat::from_rotation_y(std::f64::consts::FRAC_PI_2);
     marker(&mut sys, 1, 1, DVec3::ZERO, along_x);
     marker(&mut sys, 2, 2, DVec3::ZERO, along_x);
-    joint(&mut sys, JointKind::Prismatic);
+    joint(&mut sys, 1, JointKind::Prismatic, 1, 2);
     sys
 }
 
@@ -179,10 +99,6 @@ fn forced_oscillation_steady_state() {
             .filter(|f| f.time >= 10.0)
             .map(|f| (x_of(f) - FREE - amplitude * (big_omega * f.time - phase).sin()).abs())
             .fold(0.0, f64::max);
-        eprintln!(
-            "r = {r}: X = {amplitude:.5e}, worst {worst:.2e}, {:?}",
-            sim.stats
-        );
         assert!(
             worst < 2e-3 * amplitude,
             "r = {r}: steady-state error {worst:e} of {amplitude:e}"
@@ -198,7 +114,7 @@ fn follower_and_world_forces_in_equilibrium() {
     let (tip, ratio) = (0.9, 0.6);
     let f = ratio * M * G * L / tip;
     for (follower, expected) in [(true, ratio.asin()), (false, ratio.atan())] {
-        let mut sys = pendulum(0.0, true);
+        let mut sys = pendulum(0.0);
         marker(&mut sys, 3, 2, DVec3::new(0.0, -tip, 0.0), DQuat::IDENTITY);
         add(
             &mut sys,
@@ -227,7 +143,7 @@ fn follower_and_world_forces_in_equilibrium() {
 #[test]
 fn torque_of_joint_coordinate_is_a_torsion_spring() {
     let (kt, theta0) = (3.0, 0.3);
-    let mut sys = pendulum(theta0, false);
+    let mut sys = weightless(theta0);
     add(
         &mut sys,
         ForceElement::Torque {
@@ -303,7 +219,7 @@ fn preloaded_spring_statics_and_energy() {
     let mut sys = System::new("hanging");
     sys.gravity = Some(DVec3::new(0.0, -G, 0.0));
     sys.add_body(ground()).unwrap();
-    sys.add_body(part(
+    sys.add_body(link(
         DVec3::ZERO,
         DVec3::new(0.0, -0.3, 0.0),
         DQuat::IDENTITY,
@@ -312,7 +228,7 @@ fn preloaded_spring_statics_and_energy() {
     let along_y = DQuat::from_rotation_x(-std::f64::consts::FRAC_PI_2);
     marker(&mut sys, 1, 1, DVec3::ZERO, along_y);
     marker(&mut sys, 2, 2, DVec3::ZERO, along_y);
-    joint(&mut sys, JointKind::Prismatic);
+    joint(&mut sys, 1, JointKind::Prismatic, 1, 2);
     spring(&mut sys, 1, 0.0, preload);
     let eq = static_equilibrium(&sys, 0.0, None).unwrap();
     let y = eq.state.body_pose(BodyId(2)).unwrap().0.y;
@@ -345,7 +261,7 @@ fn preloaded_spring_statics_and_energy() {
 /// integrator's second-order truncation error (Simpson quadrature).
 #[test]
 fn work_energy_audit() {
-    let mut sys = pendulum(0.4, true);
+    let mut sys = pendulum(0.4);
     marker(&mut sys, 3, 2, DVec3::new(0.0, -0.9, 0.0), DQuat::IDENTITY);
     add(
         &mut sys,
@@ -402,7 +318,6 @@ fn work_energy_audit() {
             work += dt / 3.0 * (power[k - 2] + 4.0 * power[k - 1] + power[k]);
             worst = worst.max((kinetic[k] - kinetic[0] - work).abs());
         }
-        eprintln!("work-energy h = {h}: worst {worst:.2e} J of peak kinetic {peak:.3} J");
         (worst, peak)
     };
     // The mismatch is the integrator's truncation error: second order in h.
@@ -417,7 +332,7 @@ fn work_energy_audit() {
 /// The new elements validate and serialize; failures are data.
 #[test]
 fn force_elements_validate_and_round_trip() {
-    let mut sys = pendulum(0.0, true);
+    let mut sys = pendulum(0.0);
     add(
         &mut sys,
         ForceElement::Torque {
@@ -443,7 +358,7 @@ fn force_elements_validate_and_round_trip() {
     assert_eq!(serde_json::from_str::<System>(&text).unwrap(), sys);
 
     let with = |element: ForceElement| {
-        let mut s = pendulum(0.0, true);
+        let mut s = pendulum(0.0);
         s.add_force(element).unwrap();
         s
     };
@@ -532,7 +447,7 @@ fn joint_spring(sys: &mut System, slot: DriverSlot, k: f64, c: f64, free_value: 
 fn joint_torsion_spring_damper() {
     let (k, zeta, theta0) = (3.0, 0.05, 0.4);
     let c = 2.0 * zeta * (k * i_hinge()).sqrt();
-    let mut sys = pendulum(theta0, false);
+    let mut sys = weightless(theta0);
     joint_spring(&mut sys, DriverSlot::Rotation, k, c, 0.0);
     let omega = (k / i_hinge()).sqrt();
     let wd = omega * (1.0 - zeta * zeta).sqrt();
@@ -568,7 +483,7 @@ fn joint_torsion_spring_damper() {
 fn joint_spring_winds_several_turns() {
     let k = 2.0;
     let target = 6.0 * std::f64::consts::PI + 0.5;
-    let mut held = pendulum(0.0, false);
+    let mut held = weightless(0.0);
     joint_spring(&mut held, DriverSlot::Rotation, k, 0.0, 0.0);
     add(
         &mut held,
@@ -588,7 +503,7 @@ fn joint_spring_winds_several_turns() {
     );
 
     let turns = 2.5;
-    let mut spun = pendulum(0.0, false);
+    let mut spun = weightless(0.0);
     joint_spring(&mut spun, DriverSlot::Rotation, k, 0.0, 0.0);
     let omega0 = turns * std::f64::consts::TAU * (k / i_hinge()).sqrt();
     spun.bodies.get_mut(&BodyId(2)).unwrap().angular_velocity = DVec3::Z * omega0;
@@ -649,7 +564,7 @@ fn bushed(damping: f64, gravity: bool) -> System {
         sys.gravity = Some(DVec3::new(0.0, -G, 0.0));
     }
     sys.add_body(ground()).unwrap();
-    sys.add_body(part(DVec3::ZERO, DVec3::ZERO, DQuat::IDENTITY))
+    sys.add_body(link(DVec3::ZERO, DVec3::ZERO, DQuat::IDENTITY))
         .unwrap();
     marker(&mut sys, 1, 1, DVec3::ZERO, DQuat::IDENTITY);
     marker(&mut sys, 2, 2, DVec3::ZERO, DQuat::IDENTITY);
@@ -722,7 +637,6 @@ fn bushing_vibration_and_energy() {
         let e = energy(&sys, &f.state, &f.velocity).unwrap().total();
         worst_e = worst_e.max((e - e0).abs() / e0);
     }
-    eprintln!("bushing: x {worst_x:.2e}, θz {worst_r:.2e}, energy {worst_e:.2e}");
     assert!(worst_x < 1e-3 * v0 / wx, "translation error {worst_x:e}");
     assert!(worst_r < 1e-3 * w0 / wz, "torsion error {worst_r:e}");
     assert!(worst_e < 1e-6, "energy drift {worst_e:e}");
@@ -734,7 +648,7 @@ fn joint_spring_and_bushing_validate() {
     let mut sys = bushed(5.0, true);
     sys.add_body(Body {
         id: BodyId(3),
-        ..part(DVec3::ZERO, DVec3::new(1.0, 0.0, 0.0), DQuat::IDENTITY)
+        ..link(DVec3::ZERO, DVec3::new(1.0, 0.0, 0.0), DQuat::IDENTITY)
     })
     .unwrap();
     marker(&mut sys, 3, 1, DVec3::new(1.0, 0.0, 0.0), DQuat::IDENTITY);

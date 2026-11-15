@@ -302,19 +302,10 @@ fn primitive_rsur() -> Case {
     case
 }
 
-/// The output times of a case (`tstart + k·hout` up to `tend`).
-pub fn times(sim: &AsmtSimulation) -> Vec<f64> {
-    let n = ((sim.tend - sim.tstart) / sim.hout).round() as usize;
-    (0..=n).map(|k| sim.tstart + k as f64 * sim.hout).collect()
-}
-
-/// One reference frame of one part: the 18 per-part series OndselSolver
-/// writes, in its order — position (3), Bryant angles x-y-z (3), velocity
-/// (3), angular velocity (3), acceleration (3), angular acceleration (3);
-/// all world frame, of the part frame origin.
-pub type PartSample = [f64; 18];
-
-/// The series labels OndselSolver writes per part, in [`PartSample`] order.
+/// The 18 series OndselSolver writes per part, in its order: position (3),
+/// Bryant angles x-y-z (3), velocity (3), angular velocity (3),
+/// acceleration (3), angular acceleration (3); all world frame, of the part
+/// frame origin.
 pub const PART_SERIES: [&str; 18] = [
     "X", "Y", "Z", "Bryantx", "Bryanty", "Bryantz", "VX", "VY", "VZ", "OmegaX", "OmegaY", "OmegaZ",
     "AX", "AY", "AZ", "AlphaX", "AlphaY", "AlphaZ",

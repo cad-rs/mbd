@@ -14,13 +14,13 @@ use rcad_mbd::*;
 
 use cases::Reference;
 
-/// Every case is a fully prescribed mechanism this crate solves on its own.
+/// Every case is a fully prescribed mechanism (its sweep is checked
+/// against the references below) and exports.
 #[test]
 fn tier_b_cases_solve() {
     for case in cases::all() {
-        let frames = kinematic_sweep(&case.system, &cases::times(&case.sim))
-            .unwrap_or_else(|e| panic!("{}: {e}", case.name));
-        let diag = diagnose(&case.system, &frames[0].state, 0.0).unwrap();
+        let state = position_ic(&case.system, 0.0).unwrap_or_else(|e| panic!("{}: {e}", case.name));
+        let diag = diagnose(&case.system, &state, 0.0).unwrap();
         assert_eq!(diag.dof, 0, "{}: {diag:?}", case.name);
         assert!(diag.conflicting.is_empty(), "{}", case.name);
         write_asmt(&case.system, &case.sim).unwrap_or_else(|e| panic!("{}: {e}", case.name));

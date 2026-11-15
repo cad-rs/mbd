@@ -14,10 +14,11 @@ use rcad_mbd::*;
 
 use cases::Reference;
 
-fn load(name: &str) -> Option<Reference> {
+fn load(name: &str) -> Reference {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!("tests/tier_c/{name}.json"));
-    let text = std::fs::read_to_string(&path).ok()?;
-    Some(serde_json::from_str(&text).unwrap())
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("{}: {e} — see tests/tier_c/README.md", path.display()));
+    serde_json::from_str(&text).unwrap()
 }
 
 /// Every case exports to MJCF.
@@ -50,8 +51,7 @@ fn tier_c_matches_mujoco() {
     };
     let mut failures = Vec::new();
     for case in cases::all() {
-        let reference = load(case.name)
-            .unwrap_or_else(|| panic!("{}: no reference — see tests/tier_c/README.md", case.name));
+        let reference = load(case.name);
         let sim = simulate(&case.system, &reference.times, &settings).unwrap();
         let (mut worst_p, mut worst_r, mut worst_e): (f64, f64, f64) = (0.0, 0.0, 0.0);
         let e0_ours = energy(&case.system, &sim.frames[0].state, &sim.frames[0].velocity)

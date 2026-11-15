@@ -29,8 +29,8 @@
 //! accelerations: dynamics and kinematics share one constraint formulation.
 //!
 //! **Linear solves.** The instantaneous problems are saddle-point systems
-//! `[M Jᵀ; J 0]`, solved by the sparse saddle-point LDLᵀ ([`crate::sparse`], O(bodies)
-//! for chains and trees) with the dense rank-revealing QR as the
+//! `[M Jᵀ; J 0]`, solved by the sparse saddle-point LDLᵀ (`sparse` module,
+//! O(bodies) for chains and trees) with the dense rank-revealing QR as the
 //! fallback: redundant constraint equations are consistent dependent rows —
 //! their multipliers are not unique; the sparse path removes them
 //! (multiplier 0, the Adams / OndselSolver convention), the dense path

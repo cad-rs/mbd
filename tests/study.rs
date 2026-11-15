@@ -1,78 +1,17 @@
 //! M4: the study API and result tables — the kernel-neutral integration
 //! surface (data contracts, one entry point, CSV export).
 
-use glam::{DMat3, DQuat, DVec3};
+mod common;
+
+use common::*;
+use glam::{DQuat, DVec3};
 use rcad_mbd::*;
 
-const G: f64 = STANDARD_GRAVITY;
-const M: f64 = 2.0;
-const L: f64 = 0.6;
-const IZZ: f64 = 0.03;
-
-/// Compound pendulum: hinge about world Z, center of mass `L` below the
-/// hinge, gravity −Y; a marker at the tip.
-fn pendulum() -> System {
-    let mut sys = System::new("pendulum");
-    sys.gravity = Some(DVec3::new(0.0, -G, 0.0));
-    for (id, grounded) in [(1, true), (2, false)] {
-        sys.add_body(Body {
-            id: BodyId(id),
-            name: format!("b{id}"),
-            mass_kg: if grounded { 0.0 } else { M },
-            com: if grounded {
-                DVec3::ZERO
-            } else {
-                DVec3::new(0.0, -L, 0.0)
-            },
-            inertia_com: if grounded {
-                DMat3::ZERO
-            } else {
-                DMat3::from_diagonal(DVec3::new(0.04, 0.01, IZZ))
-            },
-            translation: DVec3::ZERO,
-            rotation: if grounded {
-                DQuat::IDENTITY
-            } else {
-                DQuat::from_rotation_z(0.6)
-            },
-            grounded,
-            velocity: DVec3::ZERO,
-            angular_velocity: DVec3::ZERO,
-        })
-        .unwrap();
-    }
-    for (id, body, at) in [
-        (1, 1, DVec3::ZERO),
-        (2, 2, DVec3::ZERO),
-        (3, 2, DVec3::new(0.0, -0.9, 0.0)),
-    ] {
-        sys.add_marker(Marker {
-            id: MarkerId(id),
-            name: format!("m{id}"),
-            body: BodyId(body),
-            translation: at,
-            rotation: DQuat::IDENTITY,
-        })
-        .unwrap();
-    }
-    sys.add_joint(Joint {
-        id: JointId(1),
-        name: "hinge".into(),
-        kind: JointKind::Revolute,
-        marker1: MarkerId(1),
-        marker2: MarkerId(2),
-        suppressed: false,
-    })
-    .unwrap();
+/// The benchmark pendulum at 0.6 rad with a marker at the tip.
+fn swing() -> System {
+    let mut sys = pendulum(0.6);
+    marker(&mut sys, 3, 2, DVec3::new(0.0, -0.9, 0.0), DQuat::IDENTITY);
     sys
-}
-
-fn i_hinge() -> f64 {
-    IZZ + M * L * L
-}
-
-fn close(a: f64, b: f64, tol: f64, what: &str) {
-    assert!((a - b).abs() <= tol * (1.0 + b.abs()), "{what}: {a} vs {b}");
 }
 
 fn angle_measure() -> MeasureRequest {
@@ -134,7 +73,7 @@ fn study_documents_are_stable() {
 /// on every frame.
 #[test]
 fn kinematic_study_reports_efforts() {
-    let mut sys = pendulum();
+    let mut sys = swing();
     sys.add_driver(Driver {
         joint: JointId(1),
         slot: DriverSlot::Rotation,
@@ -185,7 +124,7 @@ fn kinematic_study_reports_efforts() {
 /// with one row per output time.
 #[test]
 fn dynamic_study_tables() {
-    let sys = pendulum();
+    let sys = swing();
     let study = Study {
         name: "swing".into(),
         analysis: Analysis::Dynamic {
@@ -253,7 +192,7 @@ fn dynamic_study_tables() {
 /// pendulum holds it with `m·g·l·sin θ(t)` at every output time.
 #[test]
 fn static_study_is_quasi_static() {
-    let mut sys = pendulum();
+    let mut sys = swing();
     sys.add_driver(Driver {
         joint: JointId(1),
         slot: DriverSlot::Rotation,
@@ -292,7 +231,7 @@ fn static_study_is_quasi_static() {
 /// Unusable studies are data.
 #[test]
 fn bad_studies_are_refused() {
-    let sys = pendulum();
+    let sys = swing();
     let base = Study {
         name: "x".into(),
         analysis: Analysis::Dynamic {

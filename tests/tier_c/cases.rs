@@ -299,10 +299,13 @@ fn cart_pendulum() -> Case {
     }
 }
 
+/// The four-bar's crank, coupler, rocker and ground lengths.
+pub const FOUR_BAR: (f64, f64, f64, f64) = (0.1, 0.3, 0.25, 0.3);
+
 /// A planar four-bar of revolutes about world Z swinging under gravity;
 /// MuJoCo closes the loop with a (soft) connect equality.
 fn four_bar() -> Case {
-    let (a, b, c, d) = (0.1, 0.3, 0.25, 0.3);
+    let (a, b, c, d) = FOUR_BAR;
     let mut sys = System::new("four-bar");
     gravity(&mut sys, -DVec3::Y);
     ground(&mut sys);
