@@ -35,14 +35,14 @@ fn tier_c_cases_export() {
     }
 }
 
-/// Energy agreement (J): both engines evaluate the same potentials.
-const ENERGY_LIMIT: f64 = 1e-5;
-
 /// Body poses and energy against MuJoCo over every case's horizon, with
 /// this crate at a 1e-10 local tolerance (observed, MuJoCo 4.0.1 RK4 at
 /// 0.1 ms: ≤ 2.5e-6 m, ≤ 8.9e-5 rad — the slender spatial-chain link
 /// spinning about its own axis —, ≤ 1.4e-6 J; the limits in `cases.rs` keep
-/// ≥ 4x headroom).
+/// ≥ 4x headroom). The rubbing pendulum is the exception: its two engines
+/// regularize Coulomb friction differently, so its limits are set by that
+/// (`cases.rs`), and the friction itself is checked against closed forms in
+/// `tests/friction_benchmarks.rs`.
 #[test]
 fn tier_c_matches_mujoco() {
     let settings = HhtSettings {
@@ -79,7 +79,7 @@ fn tier_c_matches_mujoco() {
             "{}: worst |Δ| position {worst_p:.2e} m, rotation {worst_r:.2e} rad, energy {worst_e:.2e} J; energy drift ours {drift_ours:.1e} / MuJoCo {drift_theirs:.1e} J ({})",
             case.name, reference.source
         );
-        if worst_p >= case.limits.0 || worst_r >= case.limits.1 || worst_e >= ENERGY_LIMIT {
+        if worst_p >= case.limits.0 || worst_r >= case.limits.1 || worst_e >= case.limits.2 {
             failures.push(format!(
                 "{}: position {worst_p:e}, rotation {worst_r:e}, energy {worst_e:e}",
                 case.name

@@ -1,3 +1,5 @@
+| Joint friction | M5-1 **done** | Commercial staple but mathematically dirty (Stribeck); load-dependent, after reactions |
+| Contact/impact | M5-2 | |
 # rcad-mbd — roadmap
 
 The milestone plan for the standalone multibody-dynamics library. Extracted
@@ -47,8 +49,8 @@ Simulation (same Adams lineage). Capability → milestone mapping:
 | **Dynamic simulation + time integration** (index-3 HHT-α, variable step, error control) | M2 | Adams HHT tier |
 | **Joint reactions** (bearing loads — the commercial headline feature) | M2 | λ recovery |
 | Result trajectories / energy / momentum audit | M2 | |
-| Joint friction | M5 | Commercial staple but mathematically dirty (Stribeck); after reactions |
-| Contact/impact | M5 | |
+| Joint friction | M5-1 **done** | Commercial staple but mathematically dirty (Stribeck); load-dependent, so after reactions |
+| Contact/impact | M5-2 | |
 | Flexible bodies / control co-simulation | excluded | Different order of magnitude |
 
 **Red line**: no M5 field is pre-seeded in M0–M4 models.
@@ -257,9 +259,54 @@ CSV export; card 1) and `docs/INTEGRATING.md` with `examples/adapter.rs`
 (a millimetre CAD-style model → `System`, checked against the closed form
 by `tests/adapter.rs`; card 2).
 
-### M5 (separate card, not in this roadmap's schedule)
-Joint friction (Stribeck), contact/impact (Chrono/MuJoCo class problems),
-flexible/control co-simulation.
+### M5 Friction and contact (separate card)
+Agreed with the user (2026-11-15): **M5-1 joint friction**, then **M5-2
+contact/impact**, then an optional **M5-3** second-engine contact
+cross-check. Flexible bodies and control co-simulation stay excluded.
+
+#### M5-1 Joint friction — **done**
+Adams-style load-dependent friction on the four sliding pairs
+(revolute / prismatic / cylindrical / spherical), as
+`ForceElement::JointFriction` (`friction` module):
+- The friction load is the joint's own reaction turned into a generalized
+  load by the bearing geometry — radial force at the pin radius, axial
+  force at the thrust-face radius, bending moment over the bearing
+  spacing, moment about a sliding axis at its radius, plus a preload; each
+  term switched off by a zero arm, the reaction force by Adams' "input
+  forces to friction" flag. A cylindrical joint shares one friction cone
+  between sliding and turning; a spherical joint's couple follows the
+  relative angular velocity.
+- The coefficient is the regularized Stribeck curve (smooth ramp to
+  `μ_s` over the stiction transition velocity, `STEP` fall to `μ_d` at the
+  friction transition velocity, constant beyond).
+- **`Q` now depends on `λ`**: the integrator's iteration matrix carries
+  the `∂r/∂λ` block (forward differences over the rubbing joints' rows,
+  applied as an exact low-rank correction of the symmetric factorization),
+  and the instantaneous solves iterate to the fixed point of `λ`. Measured
+  on a rubbing pendulum: 4.4 Newton iterations per step against 2.99
+  frictionless, and 12 matrix rebuilds against 49 without the block.
+- **Static equilibrium holds with stiction**: at rest the slip measure is
+  the displacement from the pose the solve started at, saturating at the
+  maximum stiction deformation, so a block rests on a slope with the
+  friction that holds it reported (`StaticEquilibrium::friction`);
+  `max_stiction_deformation = 0` is Adams' "sliding only".
+- Gates: Tier A closed forms (`tests/friction_benchmarks.rs`, 12 tests) —
+  sliding-block Coulomb acceleration, the exact energy balance of a
+  Coulomb pendulum between turning points (and the 4Δ per cycle linear
+  decay), a driven pin whose motor effort rises by exactly `μ·R·F_radial`,
+  the cylindrical friction cone, a ball socket's `μ·R·M·g/I` spin-down,
+  the stiction creep `μ_s·N·tanh(Δ/Δ_max) = M·g·sin θ`, the data gates,
+  and the integrator-health check; MJCF export of load-independent
+  friction as `frictionloss` with the `rubbing_pendulum` Tier C case
+  (model-difference limited, `tests/tier_c/README.md`).
+
+#### M5-2 Contact/impact — next
+Kernel-neutral primitive pairs only (sphere / capsule / box-vertex against
+a plane, sphere-sphere, capsule-capsule, point-plane, point-sphere), an
+Adams `IMPACT`-style penalty `k·g^e + STEP(g, 0, 0, d_max, c)·ġ` with
+regularized Coulomb friction in the tangent plane; mesh and B-rep contact
+stay with the consumer. Benchmarks: bouncing-ball restitution and Hertz
+contact time, a rolling ball, a block on a slope.
 
 ## 5. Module layout
 
@@ -269,7 +316,8 @@ src/
 ├── body.rs         // Body / Marker (mass properties, frames)
 ├── joint.rs        // joint vocabulary (PairType mapping) + constraint residuals/Jacobians
 ├── driver.rs       // drivers (curves + slots)
-├── force.rs        // force elements (gravity/spring/damper/applied)
+├── force.rs        // force elements (gravity/spring/damper/applied/friction)
+├── friction.rs     // joint friction: load from the reaction, Stribeck curve (M5-1)
 ├── system.rs       // System assembly + stable-order numbering + IC entry
 ├── jet.rs          // second-order jets: residual + Jacobian column + γ from one formulation
 ├── linalg.rs       // dense rank-revealing QR (redundant/conflicting rows, min-norm solves)

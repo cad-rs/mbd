@@ -157,6 +157,36 @@ impl System {
                 }
             }
         }
+        let mut rubbing = BTreeSet::new();
+        for force in self.forces.values() {
+            let Some(joint) = force.friction_joint() else {
+                continue;
+            };
+            let Some(j) = self.joints.get(&joint) else {
+                return Err(MbdError::new(
+                    codes::DANGLING_JOINT,
+                    format!("force element {} rubs missing joint {}", force.id().0, joint.0),
+                    "add the joint before giving it friction",
+                ));
+            };
+            if !j.kind.takes_friction() {
+                return Err(MbdError::new(
+                    codes::FRICTION_UNSUPPORTED,
+                    format!(
+                        "force element {} ({}) gives friction to {:?} joint {} ({})",
+                        force.id().0, force.name(), j.kind, j.id.0, j.name
+                    ),
+                    "friction is modelled on revolute, prismatic, cylindrical and spherical joints",
+                ));
+            }
+            if !rubbing.insert(joint) {
+                return Err(MbdError::new(
+                    codes::FRICTION_UNSUPPORTED,
+                    format!("joint {} ({}) carries two friction elements", j.id.0, j.name),
+                    "one friction element per joint; add the loads of the two into one",
+                ));
+            }
+        }
         let mut driven = BTreeSet::new();
         for driver in &self.drivers {
             let Some(joint) = self.joints.get(&driver.joint) else {

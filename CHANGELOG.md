@@ -10,7 +10,48 @@
   validation gates; serde golden round-trip tests.
 - Dependency on `rcad-gcs` declared for the M1 position-level solver.
 
-## Unreleased (M1 + M1.5 + M2 + M3 + M4 complete, performance channel, Tier C)
+## Unreleased (M1 + M1.5 + M2 + M3 + M4 complete, performance channel, Tier C, M5-1 joint friction)
+
+### M5-1 — joint friction
+
+- `ForceElement::JointFriction` on revolute / prismatic / cylindrical /
+  spherical joints (`friction` module): Adams-style **load-dependent**
+  friction `mu(slip) * N`, where the friction load `N` is the joint's own
+  reaction through the bearing geometry — radial force at the pin radius,
+  axial force at the thrust-face radius, bending moment over the bearing
+  spacing, moment about a sliding axis at its radius, plus a preload. A
+  zero arm switches its term off, `reaction_force: false` switches the
+  reaction force off (Adams' "input forces to friction"), and with all of
+  them off the friction is the constant `mu(slip) * preload`. A
+  cylindrical joint shares one friction cone between sliding and turning;
+  a spherical joint's couple follows the relative angular velocity.
+- Coefficient: the regularized Stribeck curve (`mu_static`, `mu_dynamic`,
+  `stiction_velocity`, `friction_velocity`) — a smooth ramp to the static
+  coefficient, the `STEP` fall to the dynamic one, constant beyond.
+- The equations of motion are now `Q(q, v, lambda)`: the integrator's
+  iteration matrix carries the `dr/dlambda` block (differences over the
+  rubbing joints' rows, applied as an exact low-rank correction of the
+  symmetric saddle factorization) and the instantaneous solves iterate to
+  the fixed point of the multipliers (`friction_not_converged` when they
+  do not settle). On a rubbing pendulum the block costs 4.4 Newton
+  iterations per step against 2.99 frictionless, and 12 matrix rebuilds
+  against 49 without it.
+- `static_equilibrium` holds mechanisms with stiction: at rest the slip
+  measure is the displacement from the pose the solve started at,
+  saturating at `max_stiction_deformation` (`0` leaves friction out of
+  statics). `StaticEquilibrium::friction` and `DynamicFrame::friction`
+  report each element's friction load, slip, coefficient and friction
+  force / torque (`FrictionLoad`).
+- New codes: `friction_unsupported` (a joint kind without a friction
+  model, or two elements on one joint), `friction_not_converged`.
+- MJCF export carries load-independent friction as a joint's
+  `frictionloss`; load-dependent friction is `mjcf_unsupported`. New Tier
+  C case `rubbing_pendulum` (limited by the differing regularizations, not
+  by integration error — `tests/tier_c/README.md`); the Tier C energy
+  limit is now per case.
+- Tier A: `tests/friction_benchmarks.rs` (12 tests: closed-form
+  benchmarks, the data gates, the document form).
+  Systems without friction elements are bit-identical to before.
 
 ### Code review — deduplication and simplification
 

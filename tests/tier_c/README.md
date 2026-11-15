@@ -29,6 +29,20 @@ potential + kinetic energy (gravity `−m·g·x_com`, joint and tendon springs
 `½·k·(q − q₀)²`) against `energy()`. The worst deviations and the MuJoCo
 version are printed by the test.
 
+## The friction case
+
+`rubbing_pendulum` is the one case whose two engines model the same
+physics differently: this crate's joint friction is a regularized Stribeck
+curve of the slip, MuJoCo's `frictionloss` is a Coulomb constraint its
+solver resolves. Only load-independent friction (every arm zero) maps onto
+`frictionloss` at all, and the comparison checks the torque's size and
+sign through a reversal — not the regularization: over one second the
+friction takes 0.3 J out of the pendulum in both engines and the
+trajectories part by 3.6e-3 rad (5.4e-4 J). The friction model itself is
+checked against closed forms in `tests/friction_benchmarks.rs`, which is
+where its accuracy claims live. Its case limits in `cases.rs` are set
+from the observed deviation, not from integration error.
+
 ## Observed
 
 MuJoCo 4.0.1 (RK4, 0.1 ms) against this crate at a 1e-10 local tolerance:

@@ -69,6 +69,17 @@ impl JointKind {
         }
     }
 
+    /// Whether [`crate::ForceElement::JointFriction`] has a friction model
+    /// for this kind: the sliding pairs whose bearing surfaces the
+    /// commercial tools model (revolute pin, prismatic guide, cylindrical
+    /// pin, spherical socket).
+    pub fn takes_friction(self) -> bool {
+        matches!(
+            self,
+            JointKind::Revolute | JointKind::Prismatic | JointKind::Cylindrical | JointKind::Spherical
+        )
+    }
+
     /// Whether a driver may prescribe `slot` on this kind. Rotation is the
     /// angle about the common Z axis; translation is the offset along it.
     /// Planar translation (two directions) and the universal joint's two

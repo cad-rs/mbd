@@ -30,6 +30,7 @@ pub mod driver;
 pub mod dynamics;
 pub mod error;
 pub mod force;
+pub mod friction;
 pub mod integrate;
 mod jet;
 pub mod joint;
@@ -54,6 +55,7 @@ pub use dynamics::{
 };
 pub use error::{codes, MbdError};
 pub use force::{Argument, ForceElement, ForceId, Function};
+pub use friction::FrictionLoad;
 pub use integrate::{
     simulate, HhtSettings, IntegrationStats, Simulation, DEFAULT_ALPHA, DEFAULT_ERROR_TOL,
 };

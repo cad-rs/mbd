@@ -87,4 +87,12 @@ pub mod codes {
     pub const BAD_STUDY: &str = "bad_study";
     /// The system uses something the MJCF export does not cover.
     pub const MJCF_UNSUPPORTED: &str = "mjcf_unsupported";
+    /// Joint friction on a joint kind that has no friction model, or two
+    /// friction elements on one joint.
+    pub const FRICTION_UNSUPPORTED: &str = "friction_unsupported";
+    /// Load-dependent joint friction did not settle: the friction load and
+    /// the reaction it reads are a fixed point the solve could not reach
+    /// (a coefficient and arm large enough that the friction load exceeds
+    /// what the joint can carry).
+    pub const FRICTION_NOT_CONVERGED: &str = "friction_not_converged";
 }

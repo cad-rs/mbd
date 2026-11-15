@@ -13,8 +13,11 @@ pub struct Case {
     pub system: System,
     pub end: f64,
     pub hout: f64,
-    /// Worst position deviation allowed (m) and rotation deviation (rad).
-    pub limits: (f64, f64),
+    /// Worst deviation allowed: position (m), rotation (rad) and energy
+    /// (J). The energy limit is the same for every case whose only
+    /// difference is integration error; a case whose two engines model the
+    /// same physics differently says so where it is set.
+    pub limits: (f64, f64, f64),
 }
 
 pub fn all() -> Vec<Case> {
@@ -24,6 +27,7 @@ pub fn all() -> Vec<Case> {
         tumbler(),
         cart_pendulum(),
         four_bar(),
+        rubbing_pendulum(),
     ]
 }
 
@@ -130,7 +134,7 @@ fn double_pendulum() -> Case {
         system: sys,
         end: 2.0,
         hout: 0.01,
-        limits: (1e-6, 5e-6),
+        limits: (1e-6, 5e-6, 1e-5),
     }
 }
 
@@ -204,7 +208,7 @@ fn spatial_chain() -> Case {
         system: sys,
         end: 1.5,
         hout: 0.01,
-        limits: (1e-5, 5e-4),
+        limits: (1e-5, 5e-4, 1e-5),
     }
 }
 
@@ -230,7 +234,7 @@ fn tumbler() -> Case {
         system: sys,
         end: 3.0,
         hout: 0.01,
-        limits: (1e-5, 1e-5),
+        limits: (1e-5, 1e-5, 1e-5),
     }
 }
 
@@ -295,7 +299,7 @@ fn cart_pendulum() -> Case {
         system: sys,
         end: 2.0,
         hout: 0.01,
-        limits: (1e-5, 1e-5),
+        limits: (1e-5, 1e-5, 1e-5),
     }
 }
 
@@ -340,7 +344,58 @@ fn four_bar() -> Case {
         system: sys,
         end: 1.0,
         hout: 0.01,
-        limits: (2e-6, 2e-5),
+        limits: (2e-6, 2e-5, 1e-5),
+    }
+}
+
+/// A pendulum whose hinge rubs with a constant friction torque (M5-1,
+/// every arm zero so the load is the preload alone) — the one friction
+/// model MuJoCo also has, as a joint's `frictionloss`. The two
+/// regularizations differ (a solver-side Coulomb constraint against this
+/// crate's Stribeck curve of the slip), so the agreement is the loosest of
+/// the cases: it checks the torque's size and sign through a reversal, not
+/// the regularization.
+fn rubbing_pendulum() -> Case {
+    let mut sys = System::new("rubbing pendulum");
+    gravity(&mut sys, -DVec3::Y);
+    ground(&mut sys);
+    link(
+        &mut sys,
+        2,
+        1.0,
+        DVec3::new(0.0, -0.3, 0.0),
+        DVec3::new(0.02, 0.002, 0.02),
+        DVec3::ZERO,
+        DQuat::from_rotation_z(1.0),
+    );
+    marker(&mut sys, 1, 1, DVec3::ZERO, DQuat::IDENTITY);
+    marker(&mut sys, 2, 2, DVec3::ZERO, DQuat::IDENTITY);
+    joint(&mut sys, 1, JointKind::Revolute, 1, 2);
+    sys.add_force(ForceElement::JointFriction {
+        id: ForceId(1),
+        name: "hinge friction".into(),
+        joint: JointId(1),
+        mu_static: 0.5,
+        mu_dynamic: 0.5,
+        stiction_velocity: 1.0e-4,
+        friction_velocity: 1.0e-4,
+        reaction_force: false,
+        pin_radius: 0.0,
+        thrust_arm: 0.0,
+        bending_arm: 0.0,
+        preload: 0.2,
+        max_stiction_deformation: 1.0e-4,
+    })
+    .unwrap();
+    Case {
+        name: "rubbing_pendulum",
+        system: sys,
+        end: 1.0,
+        hout: 0.01,
+        // The friction regularizations differ, so this case is limited by
+        // the models, not by integration error: observed 3.6e-3 rad and
+        // 5.4e-4 J of the 0.3 J the friction takes out over the second.
+        limits: (1e-6, 1e-2, 2e-3),
     }
 }
 

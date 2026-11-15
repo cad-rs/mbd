@@ -546,6 +546,65 @@ impl<'a> Problem<'a> {
         }
     }
 
+    /// The wrench one joint's own constraint rows carry for the
+    /// multipliers `lambda` (indexed over [`Problem::rows`]): the force on
+    /// marker I's body and the torque about marker I's origin, world frame
+    /// — that joint's share of `−Jᵀλ`, the convention
+    /// [`crate::reaction`] reports. Driver rows are not part of it: an
+    /// actuator effort is not a bearing load. A suppressed joint (no rows)
+    /// carries nothing.
+    pub(crate) fn joint_wrench(
+        &self,
+        params: &[f64],
+        joint: JointId,
+        lambda: &[f64],
+    ) -> (DVec3, DVec3) {
+        let owner = EquationOwner::Joint(joint);
+        let Some(group) = self.groups.iter().find(|g| g.owner == owner) else {
+            return (DVec3::ZERO, DVec3::ZERO);
+        };
+        let start = group.start;
+        let n_rows = self.rows[start..]
+            .iter()
+            .take_while(|r| r.owner == owner)
+            .count();
+        let j = &self.sys.joints[&joint];
+        let slot_i = self.slot_of[&self.sys.markers[&j.marker1].body];
+        let slot_j = self.slot_of[&self.sys.markers[&j.marker2].body];
+        let rest = vec![Twist::default(); self.n_bodies()];
+        let p_i = self.frame(params, &rest, j.marker1).p.v;
+        let mut motion = rest.clone();
+        let mut buf = Vec::with_capacity(6);
+        // The wrench on one body at its own origin: `−Σ λ_k ∂Φ_k/∂(v, ω)`.
+        let mut load = |slot: usize| -> Option<(DVec3, DVec3)> {
+            self.col_of[slot]?;
+            let mut w = [0.0; BODY_TWIST];
+            for (dir, wd) in w.iter_mut().enumerate() {
+                motion[slot] = Twist::unit(dir);
+                buf.clear();
+                self.owner_jets(params, &motion, owner, &mut buf);
+                *wd = -buf[..n_rows]
+                    .iter()
+                    .enumerate()
+                    .map(|(r, jet)| lambda[start + r] * jet.d)
+                    .sum::<f64>();
+            }
+            motion[slot] = Twist::default();
+            Some((DVec3::new(w[0], w[1], w[2]), DVec3::new(w[3], w[4], w[5])))
+        };
+        if let Some((f, t)) = load(slot_i) {
+            let origin = read_pose(params, slot_i).0;
+            (f, t - (p_i - origin).cross(f))
+        } else if let Some((f, t)) = load(slot_j) {
+            // Newton's third law: equal and opposite about the same point.
+            let origin = read_pose(params, slot_j).0;
+            let t_at_pi = t - (p_i - origin).cross(f);
+            (-f, -t_at_pi)
+        } else {
+            (DVec3::ZERO, DVec3::ZERO)
+        }
+    }
+
     /// The constraint residuals at the position level (drivers: measured
     /// minus prescribed, angles wrapped).
     pub(crate) fn constraint_residuals(&self, params: &[f64], out: &mut [f64]) {

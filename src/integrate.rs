@@ -63,6 +63,7 @@ use crate::dynamics::{
     applied_forces, dynamic_ic, flatten, inertias, output_frame, slot_twists, DynamicFrame,
 };
 use crate::error::{codes, MbdError};
+use crate::friction::{read_rows, Loads};
 use crate::kinematics::{joint_slots, KinematicState, Problem, BODY_TWIST};
 use crate::linalg::{inf_norm, RowFactor};
 use crate::sparse::{dense_saddle, SaddleFactor, SparseRows, Triplets};
@@ -230,6 +231,11 @@ struct Coloring {
     groups: Vec<Vec<usize>>,
     /// Closed neighbourhood of every slot (itself included).
     neighbors: Vec<Vec<usize>>,
+    /// The multiplier columns the iteration matrix needs beyond `Jᵀ`:
+    /// where a load-dependent joint friction makes `Q` depend on `λ`
+    /// ([`crate::friction`]). Empty without such friction, and then the
+    /// matrix is exactly the M2 one.
+    lambda_columns: Vec<usize>,
 }
 
 impl Coloring {
@@ -256,6 +262,9 @@ impl Coloring {
             if let Some((joint, _)) = element.measured_joint() {
                 slots.extend(joint_slots(sys, &problem.slot_of, joint));
             }
+            if let Some(joint) = element.friction_joint() {
+                slots.extend(joint_slots(sys, &problem.slot_of, joint));
+            }
             couple(&slots);
         }
         let free = |s: usize| problem.col_of[s].is_some();
@@ -279,6 +288,7 @@ impl Coloring {
         Self {
             groups,
             neighbors: adj.into_iter().map(|s| s.into_iter().collect()).collect(),
+            lambda_columns: read_rows(problem),
         }
     }
 }
@@ -323,7 +333,7 @@ impl Step<'_, '_> {
         let (params, v) = self.advance(x);
         let vel = problem.twists(&v);
         let acc = problem.twists(x);
-        let mut net = applied_forces(problem, &params, &vel)?;
+        let mut net = applied_forces(problem, &params, &vel, Loads::dynamic(lambda))?;
         for ((slot, i), n) in inertias(problem.sys, &params)
             .iter()
             .enumerate()
@@ -372,19 +382,66 @@ impl Step<'_, '_> {
         Ok(base)
     }
 
-    /// The iteration matrix at `(x, λ)`: `[∂r/∂q̈ Jᵀ; J 0]`. `∂r/∂q̈` by
+    /// The iteration matrix at `(x, λ)`: `[∂r/∂q̈ ∂r/∂λ; J 0]`. `∂r/∂q̈` by
     /// forward differences, one residual evaluation per colour group and
-    /// direction ([`Coloring`]).
+    /// direction ([`Coloring`]); `∂r/∂λ = Jᵀ − ∂Q/∂λ`, whose friction part
+    /// rides along as a low-rank correction of the factored matrix
+    /// ([`LambdaBlock`]).
     fn matrix(&self, x: &[f64], lambda: &[f64], base: &Eval) -> Result<Factor, MbdError> {
         let n = x.len();
         let a = self.fd_triplets(x, lambda, base)?;
+        let correction = self.lambda_triplets(base, lambda)?;
         // Sparse LDLᵀ of the symmetric part (a modified-Newton matrix may be
         // approximate); the dense QR when it declines.
-        if let Some(f) = SaddleFactor::new(n, &a, &base.j) {
-            return Ok(Factor::Sparse(f));
+        let inner = match SaddleFactor::new(n, &a, &base.j) {
+            Some(f) => Inner::Sparse(f),
+            None => {
+                let rows = dense_saddle(n, &a, &base.j);
+                Inner::Dense(RowFactor::new(&rows, rows.len()))
+            }
+        };
+        let lambda_block = LambdaBlock::new(&inner, n, base.j.len(), &correction);
+        Ok(Factor {
+            inner,
+            lambda_block,
+        })
+    }
+
+    /// `−∂Q/∂λ` by forward differences over the multipliers joint friction
+    /// reads (none: empty): the part of the iteration matrix's `λ` block
+    /// that is not `Jᵀ`. Joint friction is the only load that reads the
+    /// multipliers, so one applied-load evaluation per multiplier is
+    /// enough — and only of the joints that rub.
+    fn lambda_triplets(&self, base: &Eval, lambda: &[f64]) -> Result<Triplets, MbdError> {
+        let columns = &self.coloring.lambda_columns;
+        if columns.is_empty() {
+            return Ok(Vec::new());
         }
-        let rows = dense_saddle(n, &a, &base.j);
-        Ok(Factor::Dense(RowFactor::new(&rows, rows.len())))
+        let problem = self.problem;
+        let vel = problem.twists(&base.v);
+        let at = |l: &[f64]| -> Result<Vec<f64>, MbdError> {
+            Ok(flatten(
+                problem,
+                &applied_forces(problem, &base.params, &vel, Loads::dynamic(l))?,
+            ))
+        };
+        let q0 = at(lambda)?;
+        let mut trial = lambda.to_vec();
+        let mut entries = Vec::new();
+        for &k in columns {
+            let eps = FD_STEP * (1.0 + lambda[k].abs());
+            trial[k] = lambda[k] + eps;
+            let q = at(&trial)?;
+            trial[k] = lambda[k];
+            for (r, (a, b)) in q.iter().zip(&q0).enumerate() {
+                // `r = M·q̈ + b + Jᵀλ − Q`, so `∂r/∂λ` loses `∂Q/∂λ`.
+                let v = -(a - b) / eps;
+                if v != 0.0 {
+                    entries.push((r, k, v));
+                }
+            }
+        }
+        Ok(entries)
     }
 
     /// The entries of `∂r/∂q̈` (`n × n`) by coloured forward differences.
@@ -424,17 +481,90 @@ impl Step<'_, '_> {
 /// on `h`, only the (small) stiffness and damping terms do, so it stays a
 /// good modified-Newton matrix across step-size changes; slow convergence
 /// or a failed step rebuilds it.
-enum Factor {
+struct Factor {
+    inner: Inner,
+    /// The friction part of the `λ` block, if any ([`LambdaBlock`]).
+    lambda_block: Option<LambdaBlock>,
+}
+
+/// The factored symmetric matrix `[∂r/∂q̈ Jᵀ; J 0]`.
+enum Inner {
     Sparse(SaddleFactor),
     Dense(RowFactor),
 }
 
-impl Factor {
+impl Inner {
     fn solve(&self, rhs: &[f64]) -> Vec<f64> {
         match self {
-            Factor::Sparse(f) => f.solve_approx(rhs),
-            Factor::Dense(f) => f.solve(rhs).0,
+            Inner::Sparse(f) => f.solve_approx(rhs),
+            Inner::Dense(f) => f.solve(rhs).0,
         }
+    }
+}
+
+/// The `−∂Q/∂λ` columns of load-dependent joint friction, as a low-rank
+/// update of the factored matrix: `K_true = K + B·Cᵀ` with `B` the
+/// correction columns (non-zero in the dynamic rows only) and `Cᵀ` picking
+/// the multiplier each column belongs to, so Woodbury's identity gives the
+/// exact solve from the symmetric factorization —
+/// `K_true⁻¹ = K⁻¹ − K⁻¹B·(I + CᵀK⁻¹B)⁻¹·CᵀK⁻¹`. The rank is the number of
+/// constraint rows of the rubbing joints (five per revolute), so the extra
+/// work is a handful of triangular solves and a tiny dense factorization.
+struct LambdaBlock {
+    /// Per correction column: the row `Cᵀ` reads (`n + k`) and `K⁻¹·B_k`.
+    columns: Vec<(usize, Vec<f64>)>,
+    /// `(I + Cᵀ·K⁻¹·B)`, factored.
+    small: RowFactor,
+}
+
+impl LambdaBlock {
+    /// From the `(dynamic row, multiplier, value)` entries of `−∂Q/∂λ`.
+    fn new(inner: &Inner, n: usize, m: usize, entries: &[(usize, usize, f64)]) -> Option<Self> {
+        if entries.is_empty() {
+            return None;
+        }
+        let mut keys: Vec<usize> = entries.iter().map(|&(_, k, _)| k).collect();
+        keys.sort_unstable();
+        keys.dedup();
+        let columns: Vec<(usize, Vec<f64>)> = keys
+            .iter()
+            .map(|&k| {
+                let mut b = vec![0.0; n + m];
+                for &(r, _, v) in entries.iter().filter(|e| e.1 == k) {
+                    b[r] += v;
+                }
+                (n + k, inner.solve(&b))
+            })
+            .collect();
+        let q = keys.len();
+        let small: Vec<Vec<f64>> = (0..q)
+            .map(|i| {
+                (0..q)
+                    .map(|j| columns[j].1[n + keys[i]] + f64::from(i == j))
+                    .collect()
+            })
+            .collect();
+        Some(Self {
+            columns,
+            small: RowFactor::new(&small, q),
+        })
+    }
+}
+
+impl Factor {
+    fn solve(&self, rhs: &[f64]) -> Vec<f64> {
+        let mut x = self.inner.solve(rhs);
+        let Some(block) = &self.lambda_block else {
+            return x;
+        };
+        let c: Vec<f64> = block.columns.iter().map(|&(row, _)| x[row]).collect();
+        let (w, _) = block.small.solve(&c);
+        for (wi, (_, y)) in w.iter().zip(&block.columns) {
+            for (xi, yi) in x.iter_mut().zip(y) {
+                *xi -= wi * yi;
+            }
+        }
+        x
     }
 }
 
@@ -883,6 +1013,135 @@ mod tests {
             coloring.groups.len() < 6,
             "{} colours for 6 links",
             coloring.groups.len()
+        );
+    }
+
+    /// With load-dependent joint friction the iteration matrix is no longer
+    /// symmetric: its `λ` block is `Jᵀ − ∂Q/∂λ`. The factored matrix holds
+    /// the symmetric part and the correction rides along as a low-rank
+    /// update, so the solve must still invert the full matrix — here
+    /// checked by multiplying a solved step back through the assembled
+    /// non-symmetric matrix.
+    #[test]
+    fn the_lambda_block_solves_the_non_symmetric_matrix() {
+        let mut sys = System::new("rubbing pendulum");
+        sys.gravity = Some(DVec3::new(0.0, -9.81, 0.0));
+        for (id, grounded) in [(0u64, true), (1, false)] {
+            sys.add_body(Body {
+                id: BodyId(id),
+                name: format!("b{id}"),
+                mass_kg: if grounded { 0.0 } else { 2.0 },
+                com: DVec3::new(0.0, -0.3, 0.0),
+                inertia_com: DMat3::from_diagonal(DVec3::new(0.01, 0.01, 0.03)),
+                translation: DVec3::ZERO,
+                rotation: DQuat::from_rotation_z(0.4),
+                grounded,
+                velocity: DVec3::ZERO,
+                angular_velocity: DVec3::new(0.0, 0.0, if grounded { 0.0 } else { 1.5 }),
+            })
+            .unwrap();
+        }
+        for (m, b) in [(1u64, 0u64), (2, 1)] {
+            sys.add_marker(Marker {
+                id: MarkerId(m),
+                name: format!("m{m}"),
+                body: BodyId(b),
+                translation: DVec3::ZERO,
+                rotation: DQuat::IDENTITY,
+            })
+            .unwrap();
+        }
+        sys.add_joint(Joint {
+            id: JointId(1),
+            name: "hinge".into(),
+            kind: JointKind::Revolute,
+            marker1: MarkerId(1),
+            marker2: MarkerId(2),
+            suppressed: false,
+        })
+        .unwrap();
+        sys.add_force(ForceElement::JointFriction {
+            id: ForceId(1),
+            name: "pin".into(),
+            joint: JointId(1),
+            mu_static: 0.4,
+            mu_dynamic: 0.3,
+            stiction_velocity: 1e-3,
+            friction_velocity: 1e-2,
+            reaction_force: true,
+            pin_radius: 0.05,
+            thrust_arm: 0.0,
+            bending_arm: 0.0,
+            preload: 0.0,
+            max_stiction_deformation: 1e-4,
+        })
+        .unwrap();
+
+        let first = dynamic_ic(&sys, 0.0).unwrap();
+        let problem = Problem::new(&sys, 0.0, &first.state.angles);
+        let coloring = Coloring::new(&problem);
+        assert!(
+            !coloring.lambda_columns.is_empty(),
+            "the friction must claim its multiplier columns"
+        );
+        let point = Point::initial(&problem, &first);
+        let (a, lambda) = (point.acc.clone(), point.lambda.clone());
+        let next = Problem::new(&sys, 1e-3, &first.state.angles);
+        let step = Step {
+            problem: &next,
+            from: &point,
+            coloring: &coloring,
+            h: 1e-3,
+            alpha: -0.3,
+            beta: 1.69 / 4.0,
+            gamma: 0.8,
+        };
+        let base = step.eval(&a, &lambda).unwrap();
+        let (n, m) = (a.len(), base.j.len());
+        let factor = step.matrix(&a, &lambda, &base).unwrap();
+        assert!(factor.lambda_block.is_some(), "no correction was built");
+
+        // The matrix the solve must invert: `[∂r/∂q̈ Jᵀ − ∂Q/∂λ; J 0]`,
+        // with `∂r/∂q̈` symmetrized as the sparse path has always taken it
+        // (that part is the M2 modified-Newton approximation; the friction
+        // correction on top of it has to be exact).
+        let mut dynamic = vec![vec![0.0; n]; n];
+        for (r, c, v) in step.fd_triplets(&a, &lambda, &base).unwrap() {
+            dynamic[r][c] += v;
+        }
+        let mut k = vec![vec![0.0; n + m]; n + m];
+        for r in 0..n {
+            for c in 0..n {
+                k[r][c] = 0.5 * (dynamic[r][c] + dynamic[c][r]);
+            }
+        }
+        for (r, row) in base.j.to_dense().iter().enumerate() {
+            for (c, v) in row.iter().enumerate() {
+                k[n + r][c] += v;
+                k[c][n + r] += v;
+            }
+        }
+        for (r, c, v) in step.lambda_triplets(&base, &lambda).unwrap() {
+            k[r][n + c] += v;
+        }
+        let asymmetry = (0..n + m)
+            .flat_map(|i| (0..n + m).map(move |j| (i, j)))
+            .map(|(i, j)| (k[i][j] - k[j][i]).abs())
+            .fold(0.0_f64, f64::max);
+        assert!(asymmetry > 1e-6, "the friction should break the symmetry");
+
+        let rhs: Vec<f64> = (0..n + m).map(|i| 0.1 + 0.3 * i as f64).collect();
+        let x = factor.solve(&rhs);
+        let residual = (0..n + m)
+            .map(|i| {
+                (0..n + m).map(|j| k[i][j] * x[j]).sum::<f64>() - rhs[i]
+            })
+            .map(f64::abs)
+            .fold(0.0_f64, f64::max);
+        let scale = inf_norm(&rhs);
+        assert!(
+            residual <= 1e-7 * scale,
+            "the corrected solve left {residual:.3e} of {scale:.3e}"
         );
     }
 }

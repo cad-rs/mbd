@@ -113,6 +113,43 @@ body** and the **torque on it about marker I's origin**, world frame;
 `effort` is the torque (rotation) or force (translation) the actuator
 applies to J's body along the driven coordinate.
 
+## 5a. Joint friction
+
+`ForceElement::JointFriction` gives a revolute, prismatic, cylindrical or
+spherical joint Adams-style friction: `μ(slip)·N`, where the *friction
+load* `N` comes from the joint's own reaction (the radial force at the pin
+radius, the axial force at the thrust-face radius, the bending moment over
+the bearing spacing, a preload), in the joint's generalized units — N·m
+for a rotation, N for a translation. What an adapter needs to know:
+
+- **Set the arms you have**, leave the rest at zero: a zero arm switches
+  its term off. `reaction_force: false` with every arm zero leaves
+  `μ(slip)·preload`, the load-independent Coulomb friction.
+- **The coefficient is regularized** (`stiction_velocity`,
+  `friction_velocity`, `mu_static`, `mu_dynamic`): a smooth ramp to
+  `mu_static`, the Stribeck fall to `mu_dynamic`, constant beyond. Make
+  the transition velocities small against the joint's working speed, but
+  not so small that the error controller has to crawl through reversals.
+- **Nothing sticks for ever in a dynamic run** — that is the commercial
+  compromise too. `static_equilibrium` instead measures the slip as the
+  displacement from the pose the solve started at, saturating at
+  `max_stiction_deformation`, so a mechanism can rest held by stiction
+  (`StaticEquilibrium::friction` reports what holds it);
+  `max_stiction_deformation: 0.0` keeps friction out of statics entirely.
+- **Report it** with `DynamicFrame::friction(&sys)` (and the field on
+  `StaticEquilibrium`): per element the friction load, the slip, the
+  coefficient and the friction force / torque. The friction is *not* part
+  of `Reaction` — a reaction is the constraint load, the friction is an
+  applied load the joint's own reaction creates.
+- **One element per joint**, and only on the four kinds above
+  (`friction_unsupported` otherwise). Friction makes the loads depend on
+  the multipliers, so the instantaneous solves iterate to the fixed point
+  of `λ` (`friction_not_converged` if an extreme coefficient and arm never
+  settle) and the integrator carries the `∂r/∂λ` block.
+- Exports: the MJCF cross-check carries load-independent friction as
+  MuJoCo's `frictionloss`; anything load-dependent is
+  `mjcf_unsupported`. The `.asmt` export does not carry friction.
+
 ## 6. Redundancy
 
 Real assemblies are over-constrained (a planar linkage built from 3D
@@ -144,7 +181,9 @@ codes are stable strings (`codes::*`):
 | `bad_integrator_settings` / `integration_failed` | integrator data / a step that cannot complete |
 | `bad_time_grid` / `bad_study` | unusable output times or study data |
 | `state_mismatch` | a state or multipliers from another system |
-| `asmt_unsupported` | the OndselSolver `.asmt` export cannot represent the input |
+| `friction_unsupported` | friction on a joint kind without a friction model, or two friction elements on one joint |
+| `friction_not_converged` | the friction load and the reaction it reads never settled |
+| `asmt_unsupported` / `mjcf_unsupported` | the OndselSolver `.asmt` / MuJoCo MJCF export cannot represent the input |
 
 ## 8. Determinism and serialization
 
@@ -160,7 +199,8 @@ exact float round trips through JSON.
    SI about the center of mass, in the part axes.
 2. Two markers per mate at the mate frame, each in its own body's frame;
    pick the `JointKind` per §3.
-3. Motors → `Driver`s; springs, loads, gravity → force elements.
+3. Motors → `Driver`s; springs, loads, gravity → force elements; bearing
+   friction → `JointFriction` (§5a).
 4. `sys.validate()` and surface `MbdError` codes to your users.
 5. Describe the analysis as a `Study`, `run_study`, map `StudyResult` back
    onto your parts and mates (keep your own id lookup, as the sample's

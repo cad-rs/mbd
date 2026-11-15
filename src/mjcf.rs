@@ -170,6 +170,8 @@ struct Emitter<'a> {
     sites: &'a BTreeMap<BodyId, Vec<(String, DVec3)>>,
     /// Joint springs by tree joint: stiffness, damping, reference.
     joint_spring: &'a BTreeMap<(JointId, DriverSlot), (f64, f64, f64)>,
+    /// Constant Coulomb friction per tree joint coordinate (`frictionloss`).
+    friction_loss: &'a BTreeMap<(JointId, DriverSlot), f64>,
     out: String,
     /// Initial `qvel`, in MuJoCo's dof order.
     qvel: Vec<f64>,
@@ -248,9 +250,14 @@ impl Emitter<'_> {
                 .get(&(jid, slot))
                 .map(|(k, c, r0)| format!(" stiffness=\"{k}\" damping=\"{c}\" springref=\"{r0}\""))
                 .unwrap_or_default();
+            let friction = self
+                .friction_loss
+                .get(&(jid, slot))
+                .map(|loss| format!(" frictionloss=\"{loss}\""))
+                .unwrap_or_default();
             let _ = writeln!(
                 self.out,
-                "{indent}  <joint name=\"j{}{suffix}\" type=\"{kind}\" pos=\"{pos}\" axis=\"{axis}\"{spring}/>",
+                "{indent}  <joint name=\"j{}{suffix}\" type=\"{kind}\" pos=\"{pos}\" axis=\"{axis}\"{spring}{friction}/>",
                 jid.0
             );
             self.qvel.push(0.0);
@@ -263,9 +270,14 @@ impl Emitter<'_> {
                 line("slide", DriverSlot::Translation, "t");
             }
             JointKind::Spherical => {
+                let friction = self
+                    .friction_loss
+                    .get(&(jid, DriverSlot::Rotation))
+                    .map(|loss| format!(" frictionloss=\"{loss}\""))
+                    .unwrap_or_default();
                 let _ = writeln!(
                     self.out,
-                    "{indent}  <joint name=\"j{}\" type=\"ball\" pos=\"{pos}\"/>",
+                    "{indent}  <joint name=\"j{}\" type=\"ball\" pos=\"{pos}\"{friction}/>",
                     jid.0
                 );
                 self.qvel.extend([0.0; 3]);
@@ -291,6 +303,7 @@ pub fn write_mjcf(sys: &System) -> Result<String, MbdError> {
     let state = position_ic(sys, 0.0)?;
     let pose = |b: BodyId| state.body_pose(b).expect("own body");
     let mut joint_spring = BTreeMap::new();
+    let mut friction_loss: BTreeMap<(JointId, DriverSlot), f64> = BTreeMap::new();
     let mut tendons = Vec::new();
     for f in sys.forces.values() {
         match f {
@@ -316,6 +329,27 @@ pub fn write_mjcf(sys: &System) -> Result<String, MbdError> {
                 ..
             } if *preload == 0.0 => {
                 tendons.push((*id, *marker1, *marker2, *stiffness, *damping, *free_length))
+            }
+            // MuJoCo's `frictionloss` is a constant Coulomb loss on the
+            // joint's coordinate, so only load-independent friction (every
+            // arm zero: `μ_d·preload`) has a counterpart. Its own
+            // regularization is the solver's, not this crate's Stribeck
+            // curve, so the cross-check holds away from zero slip.
+            ForceElement::JointFriction {
+                joint,
+                mu_dynamic,
+                preload,
+                ..
+            } if !f.reads_reactions() && !tree.loops.contains(joint) => {
+                let loss = mu_dynamic * preload;
+                // The slip the constant friction acts on: with a zero pin
+                // radius a cylindrical joint's turning rubs nothing, so
+                // only its sliding carries the loss.
+                let slot = match sys.joints[joint].kind {
+                    JointKind::Prismatic | JointKind::Cylindrical => DriverSlot::Translation,
+                    _ => DriverSlot::Rotation,
+                };
+                friction_loss.insert((*joint, slot), loss);
             }
             other => {
                 return Err(unsupported(format!(
@@ -386,6 +420,7 @@ pub fn write_mjcf(sys: &System) -> Result<String, MbdError> {
         state: &state,
         sites: &sites,
         joint_spring: &joint_spring,
+        friction_loss: &friction_loss,
         out,
         qvel: Vec::new(),
     };

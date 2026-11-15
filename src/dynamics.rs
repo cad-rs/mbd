@@ -44,6 +44,9 @@ use glam::{DMat3, DQuat, DVec3};
 use crate::body::{Body, BodyId, MarkerId};
 use crate::error::{codes, MbdError};
 use crate::force::{Argument, ForceElement, Function};
+use crate::friction::{
+    friction_forces, friction_report, has_friction, reads_reactions, FrictionLoad, Loads,
+};
 use crate::driver::DriverSlot;
 use crate::joint::JointId;
 use crate::kinematics::{
@@ -72,6 +75,14 @@ const STIFFNESS_STEP: f64 = 1.0e-6;
 /// Static equilibrium: largest rotation (rad) one Newton step may apply to a
 /// body.
 const MAX_STEP_ROTATION: f64 = 0.5;
+
+/// Load-dependent friction: how many times an instantaneous solve may
+/// re-solve for the fixed point of the multipliers.
+const FRICTION_MAX_ITER: usize = 60;
+
+/// Load-dependent friction: the relative multiplier change an
+/// instantaneous solve settles for.
+const FRICTION_TOL: f64 = 1.0e-12;
 
 /// A body's mass properties about its frame origin, in world axes, at one
 /// orientation.
@@ -165,6 +176,13 @@ pub struct StaticEquilibrium {
     pub redundant: Vec<EquationRef>,
     /// Newton iterations taken.
     pub iterations: usize,
+    /// The joint friction holding the equilibrium, in force-element id
+    /// order (empty without friction elements). At rest the friction is
+    /// the stiction one: the load that holds the mechanism within
+    /// `max_stiction_deformation` of the pose the solve started from (see
+    /// [`crate::ForceElement::JointFriction`]), which is why it is
+    /// reported with the equilibrium rather than recomputed from the state.
+    pub friction: Vec<FrictionLoad>,
 }
 
 /// Energy audit of a state: kinetic, gravitational and elastic (spring)
@@ -228,11 +246,14 @@ pub(crate) fn inertias(sys: &System, params: &[f64]) -> Vec<Option<BodyInertia>>
 
 /// The generalized applied forces `Q` per slot (force, torque about the body
 /// origin): gravity and the force elements, at pose `params` and velocity
-/// `vel`.
+/// `vel`. Joint friction also reads the constraint multipliers of `loads`
+/// (its load follows the joint's reaction); multipliers that do not cover
+/// the constraint rows read as zero, which leaves friction at its preload.
 pub(crate) fn applied_forces(
     problem: &Problem,
     params: &[f64],
     vel: &[Twist],
+    loads: Loads,
 ) -> Result<Vec<Twist>, MbdError> {
     let sys = problem.sys;
     let mut q = vec![Twist::default(); problem.n_bodies()];
@@ -391,14 +412,20 @@ pub(crate) fn applied_forces(
                 q[sj].angular += torque;
                 q[si].angular -= torque;
             }
+            // Friction reads the multipliers, so it is applied after the
+            // state-only elements ([`friction_forces`]).
+            ForceElement::JointFriction { .. } => {}
         }
+    }
+    if has_friction(sys) {
+        friction_forces(problem, params, vel, loads, &mut q);
     }
     Ok(q)
 }
 
 /// `∂q/∂(v, ω)` of a joint coordinate for each free body of the joint —
 /// the direction along which a generalized force on the coordinate acts.
-fn coordinate_gradient(
+pub(crate) fn coordinate_gradient(
     problem: &Problem,
     params: &[f64],
     joint: JointId,
@@ -527,7 +554,16 @@ pub fn power(
     check_state(sys, state)?;
     let problem = Problem::new(sys, time, &state.angles);
     let vel = slot_twists(sys, velocity);
-    let q = flatten(&problem, &applied_forces(&problem, &state.params, &vel)?);
+    // Friction's load follows the reactions, so the audit needs them.
+    let lambda = if has_friction(sys) {
+        accelerations(&problem, &state.params, &vel)?.lambda
+    } else {
+        Vec::new()
+    };
+    let q = flatten(
+        &problem,
+        &applied_forces(&problem, &state.params, &vel, Loads::dynamic(&lambda))?,
+    );
     Ok(q.iter()
         .zip(flatten(&problem, &vel))
         .map(|(a, b)| a * b)
@@ -634,34 +670,62 @@ pub(crate) fn accelerations(
     vel: &[Twist],
 ) -> Result<Accelerations, MbdError> {
     let inertia = inertias(problem.sys, params);
-    let q = applied_forces(problem, params, vel)?;
-    let mut top = vec![0.0; problem.n_cols];
-    for (slot, col) in problem.col_of.iter().enumerate() {
-        let (Some(b), Some(i)) = (*col, inertia[slot]) else {
-            continue;
-        };
-        let bias = i.bias(vel[slot].angular);
-        let f = Twist {
-            linear: q[slot].linear - bias.linear,
-            angular: q[slot].angular - bias.angular,
-        };
-        top[b..b + BODY_TWIST].copy_from_slice(&f.to_array());
-    }
+    let mass = mass_triplets(problem, &inertia);
     let j = problem.jacobian_sparse(params);
     let bottom = problem.acceleration_rhs(params, vel);
-    let solution = solve_saddle(
-        problem,
-        &mass_triplets(problem, &inertia),
-        &j,
-        &top,
-        &bottom,
-        "forward dynamics",
-    )?;
-    Ok(Accelerations {
+    let solve = |lambda: &[f64]| -> Result<SaddleSolution, MbdError> {
+        let q = applied_forces(problem, params, vel, Loads::dynamic(lambda))?;
+        let mut top = vec![0.0; problem.n_cols];
+        for (slot, col) in problem.col_of.iter().enumerate() {
+            let (Some(b), Some(i)) = (*col, inertia[slot]) else {
+                continue;
+            };
+            let bias = i.bias(vel[slot].angular);
+            let f = Twist {
+                linear: q[slot].linear - bias.linear,
+                angular: q[slot].angular - bias.angular,
+            };
+            top[b..b + BODY_TWIST].copy_from_slice(&f.to_array());
+        }
+        solve_saddle(problem, &mass, &j, &top, &bottom, "forward dynamics")
+    };
+    let done = |solution: SaddleSolution| Accelerations {
         acc: problem.twists(&solution.x),
         lambda: solution.mu,
         redundant: solution.redundant,
-    })
+    };
+    // Load-dependent friction makes `Q` depend on the multipliers: the
+    // saddle point is then the fixed point of `λ ↦ solve(Q(λ))`, reached
+    // by repeating the solve (the map contracts with the friction
+    // coefficient times its arm, so a handful of solves suffice at
+    // physical parameters).
+    let mut lambda = Vec::new();
+    if !reads_reactions(problem.sys) {
+        return Ok(done(solve(&lambda)?));
+    }
+    lambda = vec![0.0; problem.rows.len()];
+    let mut change = f64::INFINITY;
+    for _ in 0..FRICTION_MAX_ITER {
+        let solution = solve(&lambda)?;
+        change = solution
+            .mu
+            .iter()
+            .zip(&lambda)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f64, f64::max);
+        lambda.copy_from_slice(&solution.mu);
+        if change <= FRICTION_TOL * inf_norm(&lambda).max(1.0) {
+            return Ok(done(solution));
+        }
+    }
+    Err(MbdError::new(
+        codes::FRICTION_NOT_CONVERGED,
+        format!(
+            "the friction load and the reaction it reads did not settle at t = {} after {FRICTION_MAX_ITER} solves (last multiplier change {change:.3e})",
+            problem.time,
+        ),
+        "lower the friction coefficient or the friction arms, or check that the joint can carry the load its friction creates",
+    ))
 }
 
 /// Forward dynamics at one instant: given a pose and velocity satisfying the
@@ -765,6 +829,27 @@ fn dynamic_frame(
     })
 }
 
+impl DynamicFrame {
+    /// The joint friction at this instant, in force-element id order
+    /// (empty without friction elements): the load each element applies,
+    /// the friction load it read from the reactions, and the slip it saw.
+    /// The friction is already part of this frame's accelerations and
+    /// multipliers — this reports it the way the commercial tools plot a
+    /// joint's friction force and torque.
+    pub fn friction(&self, sys: &System) -> Result<Vec<FrictionLoad>, MbdError> {
+        check_state(sys, &self.state)?;
+        let problem = Problem::new(sys, self.time, &self.state.angles);
+        let vel = slot_twists(sys, &self.velocity);
+        let lambda: Vec<f64> = self.multipliers.iter().map(|(_, l)| *l).collect();
+        Ok(friction_report(
+            &problem,
+            &self.state.params,
+            &vel,
+            Loads::dynamic(&lambda),
+        ))
+    }
+}
+
 /// The dynamic initial condition at `time`: the position IC from the
 /// authored poses, the authored body velocities projected onto the
 /// constraints ([`velocity_ic`]), and the forward-dynamics accelerations
@@ -793,9 +878,13 @@ fn static_imbalance(
     problem: &Problem,
     params: &[f64],
     lambda: &[f64],
+    anchor: &[f64],
 ) -> Result<(Vec<f64>, Vec<Vec<f64>>), MbdError> {
     let rest = vec![Twist::default(); problem.n_bodies()];
-    let mut f = flatten(problem, &applied_forces(problem, params, &rest)?);
+    let mut f = flatten(
+        problem,
+        &applied_forces(problem, params, &rest, Loads::static_at(lambda, anchor))?,
+    );
     let j = problem.jacobian(params);
     for (jr, l) in j.iter().zip(lambda) {
         for (fi, ji) in f.iter_mut().zip(jr) {
@@ -829,17 +918,33 @@ pub fn static_equilibrium(
     let mut problem = Problem::new(sys, time, &state.angles);
     let n = problem.n_cols;
     let m = problem.rows.len();
+    // The pose friction measures its stiction displacement from: where the
+    // mechanism stood when the solve started.
+    let anchor = state.params.clone();
     let mut params = state.params.clone();
     let mut lambda = vec![0.0; m];
     let mut phi = vec![0.0; m];
-    let (f0, _) = static_imbalance(&problem, &params, &lambda)?;
+    if reads_reactions(sys) {
+        // Load-dependent friction has to read a reaction before it can
+        // apply anything, and a zero one would leave the direction it
+        // resists with no stiffness at all. The minimum-norm multipliers
+        // of the load balance at the start pose are that first estimate.
+        let rest = vec![Twist::default(); problem.n_bodies()];
+        let q = flatten(
+            &problem,
+            &applied_forces(&problem, &params, &rest, Loads::static_at(&lambda, &anchor))?,
+        );
+        let j = problem.jacobian(&params);
+        lambda = RowFactor::new(&transpose(&j, n), m).solve(&q).0;
+    }
+    let (f0, _) = static_imbalance(&problem, &params, &lambda, &anchor)?;
     let load_scale = inf_norm(&f0).max(1.0);
     let merit = |f: &[f64], phi: &[f64]| {
         let a = f.iter().map(|v| v * v).sum::<f64>() / (load_scale * load_scale);
         a + phi.iter().map(|v| v * v).sum::<f64>()
     };
     for iteration in 0..STATIC_MAX_ITER {
-        let (f, j) = static_imbalance(&problem, &params, &lambda)?;
+        let (f, j) = static_imbalance(&problem, &params, &lambda, &anchor)?;
         problem.constraint_residuals(&params, &mut phi);
         if inf_norm(&f) <= STATIC_FORCE_TOL * load_scale && inf_norm(&phi) <= STATIC_CONSTRAINT_TOL
         {
@@ -848,13 +953,24 @@ pub fn static_equilibrium(
             state.angles = problem.track_angles(&state.params);
             // Report the minimum-norm multipliers at the converged pose.
             let rest = vec![Twist::default(); problem.n_bodies()];
-            let q = flatten(&problem, &applied_forces(&problem, &state.params, &rest)?);
+            let q = flatten(
+                &problem,
+                &applied_forces(
+                    &problem,
+                    &state.params,
+                    &rest,
+                    Loads::static_at(&lambda, &anchor),
+                )?,
+            );
             let (lambda, _) = RowFactor::new(&transpose(&j, n), m).solve(&q);
+            let friction =
+                friction_report(&problem, &state.params, &rest, Loads::static_at(&lambda, &anchor));
             return Ok(StaticEquilibrium {
                 time,
                 multipliers: problem.rows.iter().copied().zip(lambda).collect(),
                 redundant: problem.refs(&RowFactor::new(&j, n).dependent_sorted()),
                 iterations: iteration,
+                friction,
                 state,
             });
         }
@@ -863,9 +979,9 @@ pub fn static_equilibrium(
         let mut delta = vec![0.0; n];
         for c in 0..n {
             delta[c] = STIFFNESS_STEP;
-            let (fp, _) = static_imbalance(&problem, &problem.retract(&params, &delta), &lambda)?;
+            let (fp, _) = static_imbalance(&problem, &problem.retract(&params, &delta), &lambda, &anchor)?;
             delta[c] = -STIFFNESS_STEP;
-            let (fm, _) = static_imbalance(&problem, &problem.retract(&params, &delta), &lambda)?;
+            let (fm, _) = static_imbalance(&problem, &problem.retract(&params, &delta), &lambda, &anchor)?;
             delta[c] = 0.0;
             for (row, (p, q)) in k.iter_mut().zip(fp.iter().zip(&fm)) {
                 row[c] = -(p - q) / (2.0 * STIFFNESS_STEP);
@@ -899,7 +1015,7 @@ pub fn static_equilibrium(
             let trial = problem.retract(&params, &trial_step);
             let trial_lambda: Vec<f64> =
                 lambda.iter().zip(&dl).map(|(l, d)| l + scale * d).collect();
-            let (tf, _) = static_imbalance(&problem, &trial, &trial_lambda)?;
+            let (tf, _) = static_imbalance(&problem, &trial, &trial_lambda, &anchor)?;
             let mut tphi = vec![0.0; m];
             problem.constraint_residuals(&trial, &mut tphi);
             if merit(&tf, &tphi) < current {
@@ -918,7 +1034,7 @@ pub fn static_equilibrium(
             break;
         }
     }
-    let (f, _) = static_imbalance(&problem, &params, &lambda)?;
+    let (f, _) = static_imbalance(&problem, &params, &lambda, &anchor)?;
     problem.constraint_residuals(&params, &mut phi);
     Err(MbdError::new(
         codes::STATIC_NOT_CONVERGED,
