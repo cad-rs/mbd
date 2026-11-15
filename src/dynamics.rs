@@ -43,6 +43,9 @@ use glam::{DMat3, DQuat, DVec3};
 
 use crate::body::{Body, BodyId, MarkerId};
 use crate::error::{codes, MbdError};
+use crate::contact::{
+    contact_energy, contact_forces, contact_report, has_contact, ContactLoad,
+};
 use crate::force::{Argument, ForceElement, Function};
 use crate::friction::{
     friction_forces, friction_report, has_friction, reads_reactions, FrictionLoad, Loads,
@@ -415,10 +418,15 @@ pub(crate) fn applied_forces(
             // Friction reads the multipliers, so it is applied after the
             // state-only elements ([`friction_forces`]).
             ForceElement::JointFriction { .. } => {}
+            // Contact resolves its geometries once per element, below.
+            ForceElement::Contact { .. } => {}
         }
     }
     if has_friction(sys) {
         friction_forces(problem, params, vel, loads, &mut q);
+    }
+    if has_contact(sys) {
+        contact_forces(problem, params, vel, &mut q)?;
     }
     Ok(q)
 }
@@ -848,6 +856,18 @@ impl DynamicFrame {
             Loads::dynamic(&lambda),
         ))
     }
+
+    /// The contact loads at this instant, in force-element id order and
+    /// then candidate-point order (empty without contact elements):
+    /// penetration, normal force, slip and friction force per contact
+    /// point. Points carrying nothing are reported too, so an element's
+    /// indices mean the same thing from frame to frame.
+    pub fn contacts(&self, sys: &System) -> Result<Vec<ContactLoad>, MbdError> {
+        check_state(sys, &self.state)?;
+        let problem = Problem::new(sys, self.time, &self.state.angles);
+        let vel = slot_twists(sys, &self.velocity);
+        contact_report(&problem, &self.state.params, &vel)
+    }
 }
 
 /// The dynamic initial condition at `time`: the position IC from the
@@ -1128,6 +1148,11 @@ pub fn energy(
             }
             _ => {}
         }
+    }
+    if has_contact(sys) {
+        // The penalty's stored deformation energy (its damping and
+        // friction are dissipative, audited through `power`).
+        e.elastic += contact_energy(&problem, params, &rest)?;
     }
     Ok(e)
 }

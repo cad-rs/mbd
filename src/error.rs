@@ -87,6 +87,9 @@ pub mod codes {
     pub const BAD_STUDY: &str = "bad_study";
     /// The system uses something the MJCF export does not cover.
     pub const MJCF_UNSUPPORTED: &str = "mjcf_unsupported";
+    /// A contact between two geometries that have no contact model
+    /// (plane against plane, box against anything but a plane).
+    pub const CONTACT_UNSUPPORTED: &str = "contact_unsupported";
     /// Joint friction on a joint kind that has no friction model, or two
     /// friction elements on one joint.
     pub const FRICTION_UNSUPPORTED: &str = "friction_unsupported";

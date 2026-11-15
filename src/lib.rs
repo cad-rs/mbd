@@ -25,6 +25,7 @@
 
 pub mod asmt;
 pub mod body;
+pub mod contact;
 pub mod coupler;
 pub mod driver;
 pub mod dynamics;
@@ -46,6 +47,7 @@ pub mod system;
 
 pub use asmt::{write_asmt, AsmtSimulation};
 pub use body::{Body, BodyId, Marker, MarkerId};
+pub use contact::{ContactFriction, ContactGeometry, ContactLoad, Impact};
 pub use coupler::{Coupler, CouplerId, CouplerTerm};
 pub use driver::{Driver, DriverProfile, DriverSample, DriverSlot};
 pub use dynamics::{

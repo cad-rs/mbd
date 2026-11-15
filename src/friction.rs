@@ -126,7 +126,7 @@ fn smooth_step(x: f64) -> f64 {
 /// The regularized Stribeck coefficient at slip speed `s ≥ 0`: the ramp to
 /// `mu_static` over `v_stiction`, the fall to `mu_dynamic` at
 /// `v_friction`, constant beyond.
-fn stribeck(mu_static: f64, mu_dynamic: f64, v_stiction: f64, v_friction: f64, s: f64) -> f64 {
+pub(crate) fn stribeck(mu_static: f64, mu_dynamic: f64, v_stiction: f64, v_friction: f64, s: f64) -> f64 {
     if s >= v_friction {
         return mu_dynamic;
     }

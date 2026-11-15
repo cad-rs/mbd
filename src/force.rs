@@ -12,6 +12,7 @@ use glam::DVec3;
 use serde::{Deserialize, Serialize};
 
 use crate::body::MarkerId;
+use crate::contact::{ContactFriction, ContactGeometry, Impact};
 use crate::driver::{DriverProfile, DriverSlot};
 use crate::joint::JointId;
 
@@ -289,6 +290,26 @@ pub enum ForceElement {
         #[serde(default = "default_stiction_deformation")]
         max_stiction_deformation: f64,
     },
+    /// Penalty contact between two primitive geometries (M5-2, the Adams
+    /// `CONTACT` / `IMPACT` tier): per contact point of penetration `d`
+    /// closing at `ḋ`, a normal force
+    /// `max(0, k·dᵉ + c·ḋ·STEP(d, 0, 0, d_damp, 1))` pushing `first` along
+    /// the contact normal, plus regularized Coulomb friction in the
+    /// contact plane. The geometries are placed by their markers;
+    /// [`ContactGeometry`] lists the pairs that have a model and
+    /// [`crate::contact::contact_points`] how many contact points a pair
+    /// reports (a capsule on a plane rests on its two ends, a box on its
+    /// eight corners).
+    Contact {
+        id: ForceId,
+        name: String,
+        first: ContactGeometry,
+        second: ContactGeometry,
+        impact: Impact,
+        /// Tangential friction; `None` is a frictionless contact.
+        #[serde(default)]
+        friction: Option<ContactFriction>,
+    },
     /// A 6-DOF linear bushing (Adams `BUSHING`) between markers I
     /// (`marker1`) and J: with `d` the displacement of J's origin from I's
     /// and `θ` the rotation vector of J relative to I, both in I's axes,
@@ -339,6 +360,7 @@ impl ForceElement {
             | ForceElement::LineForce { id, .. }
             | ForceElement::JointSpringDamper { id, .. }
             | ForceElement::JointFriction { id, .. }
+            | ForceElement::Contact { id, .. }
             | ForceElement::Bushing { id, .. } => *id,
         }
     }
@@ -353,6 +375,7 @@ impl ForceElement {
             | ForceElement::LineForce { name, .. }
             | ForceElement::JointSpringDamper { name, .. }
             | ForceElement::JointFriction { name, .. }
+            | ForceElement::Contact { name, .. }
             | ForceElement::Bushing { name, .. } => name,
         }
     }
@@ -368,6 +391,9 @@ impl ForceElement {
             } => vec![*marker1, *marker2],
             ForceElement::JointSpringDamper { .. } | ForceElement::JointFriction { .. } => {
                 Vec::new()
+            }
+            ForceElement::Contact { first, second, .. } => {
+                vec![first.marker(), second.marker()]
             }
             ForceElement::AppliedForce { marker, .. }
             | ForceElement::AppliedTorque { marker, .. } => {
@@ -409,6 +435,15 @@ impl ForceElement {
             return Some((*joint, *slot));
         }
         self.function().and_then(Function::joint)
+    }
+
+    /// The contact geometry pair, if this element is a contact (for the
+    /// validation gate: not every pair of primitives has a model).
+    pub fn contact_pair(&self) -> Option<(&ContactGeometry, &ContactGeometry)> {
+        match self {
+            ForceElement::Contact { first, second, .. } => Some((first, second)),
+            _ => None,
+        }
     }
 
     /// The joint this element loads as a whole, rather than through one
@@ -548,6 +583,13 @@ impl ForceElement {
                     return Err("joint friction arms, preload and stiction deformation cannot be negative");
                 }
             }
+            ForceElement::Contact {
+                first,
+                second,
+                impact,
+                friction,
+                ..
+            } => crate::contact::check(first, second, impact, friction)?,
             ForceElement::Bushing {
                 stiffness,
                 damping,

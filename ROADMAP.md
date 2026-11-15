@@ -1,5 +1,3 @@
-| Joint friction | M5-1 **done** | Commercial staple but mathematically dirty (Stribeck); load-dependent, after reactions |
-| Contact/impact | M5-2 | |
 # rcad-mbd — roadmap
 
 The milestone plan for the standalone multibody-dynamics library. Extracted
@@ -50,7 +48,7 @@ Simulation (same Adams lineage). Capability → milestone mapping:
 | **Joint reactions** (bearing loads — the commercial headline feature) | M2 | λ recovery |
 | Result trajectories / energy / momentum audit | M2 | |
 | Joint friction | M5-1 **done** | Commercial staple but mathematically dirty (Stribeck); load-dependent, so after reactions |
-| Contact/impact | M5-2 | |
+| Contact/impact | M5-2 **done** | Penalty contact on primitives (kernel-neutral); mesh / B-rep contact is the consumer's |
 | Flexible bodies / control co-simulation | excluded | Different order of magnitude |
 
 **Red line**: no M5 field is pre-seeded in M0–M4 models.
@@ -300,13 +298,47 @@ Adams-style load-dependent friction on the four sliding pairs
   friction as `frictionloss` with the `rubbing_pendulum` Tier C case
   (model-difference limited, `tests/tier_c/README.md`).
 
-#### M5-2 Contact/impact — next
-Kernel-neutral primitive pairs only (sphere / capsule / box-vertex against
-a plane, sphere-sphere, capsule-capsule, point-plane, point-sphere), an
-Adams `IMPACT`-style penalty `k·g^e + STEP(g, 0, 0, d_max, c)·ġ` with
-regularized Coulomb friction in the tangent plane; mesh and B-rep contact
-stay with the consumer. Benchmarks: bouncing-ball restitution and Hertz
-contact time, a rolling ball, a block on a slope.
+#### M5-2 Contact/impact — **done**
+Kernel-neutral penalty contact between primitives, as
+`ForceElement::Contact` (`contact` module):
+- Geometries placed by markers (`ContactGeometry`): point, sphere, capsule,
+  box, plane. Modelled pairs: point/sphere/capsule against each other
+  (their closest pair, one contact point), and point/sphere/capsule/box
+  against a plane — a capsule on a plane rests on its two end spheres, a
+  box on its eight corners. Mesh and B-rep contact stay with the consumer;
+  an unmodelled pair is `contact_unsupported`.
+- Normal force (`Impact`, the Adams `IMPACT` form)
+  `max(0, k·dᵉ + c·ḋ·STEP(d, 0, 0, d_damp, 1))`: the damping ramps in so
+  first touch is continuous, and the clamp means a contact never pulls.
+  Tangential: optional regularized Coulomb (`ContactFriction`) on the slip
+  in the contact plane, sharing the M5-1 Stribeck curve.
+- The penalty's stored deformation `k·d^(e+1)/(e+1)` joins
+  `Energy::elastic`, so the audit balances through an impact;
+  `DynamicFrame::contacts` reports penetration, normal force, slip and
+  friction force per contact point (points carrying nothing included, so
+  indices are stable across frames).
+- **Step size** is what a stiff contact costs: on a bouncing ball at
+  `k = 1e8` the worst energy error over three bounces is 1.3e-2 at the
+  default tolerance, 4.2e-4 at 1e-8 and 2.5e-5 at 1e-10 — the step size,
+  not α, is what matters. Documented in `docs/INTEGRATING.md` §5b.
+- Gates: Tier A closed forms (`tests/contact_benchmarks.rs`, 14 tests) —
+  Hertzian impact peak `δ = ((e+1)mv²/2k)^(1/(e+1))` with restitution 1,
+  energy and impulse `2mv`; the linear contact's duration `π√(m/k)`;
+  damping monotonically lowering the restitution; resting penetration
+  `k·δᵉ = mg` (statics) for a sphere, a box's four corners and a capsule's
+  two ends; two spheres' momentum and restitution; a sliding box's `μ·g`;
+  crossed capsules' closest-line normal and force; a point as a
+  zero-radius sphere; separation costing nothing (bit-identical frames and
+  integrator statistics); the bouncing ball under error control; the data
+  gates and the document form.
+- Not exported to MJCF (MuJoCo's soft contact is a different model):
+  `mjcf_unsupported`.
+
+#### M5-3 (optional) Second-engine contact cross-check
+Chrono (SMC penalty contact) or MuJoCo at matched macroscopic quantities
+(restitution, contact duration, slide distance) — the models differ, so
+only macroscopic agreement is meaningful, as `rubbing_pendulum` already
+shows for friction.
 
 ## 5. Module layout
 
@@ -318,6 +350,7 @@ src/
 ├── driver.rs       // drivers (curves + slots)
 ├── force.rs        // force elements (gravity/spring/damper/applied/friction)
 ├── friction.rs     // joint friction: load from the reaction, Stribeck curve (M5-1)
+├── contact.rs      // penalty contact between primitives + Coulomb friction (M5-2)
 ├── system.rs       // System assembly + stable-order numbering + IC entry
 ├── jet.rs          // second-order jets: residual + Jacobian column + γ from one formulation
 ├── linalg.rs       // dense rank-revealing QR (redundant/conflicting rows, min-norm solves)

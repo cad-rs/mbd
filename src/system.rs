@@ -157,6 +157,22 @@ impl System {
                 }
             }
         }
+        for force in self.forces.values() {
+            let Some((first, second)) = force.contact_pair() else {
+                continue;
+            };
+            if let Err(why) = crate::contact::supported(first, second) {
+                return Err(MbdError::new(
+                    codes::CONTACT_UNSUPPORTED,
+                    format!(
+                        "contact {} ({}) pairs geometries with no contact model: {why}",
+                        force.id().0,
+                        force.name()
+                    ),
+                    "pair point/sphere/capsule geometries with each other, or point/sphere/capsule/box with a plane",
+                ));
+            }
+        }
         let mut rubbing = BTreeSet::new();
         for force in self.forces.values() {
             let Some(joint) = force.friction_joint() else {

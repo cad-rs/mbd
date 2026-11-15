@@ -150,6 +150,45 @@ for a rotation, N for a translation. What an adapter needs to know:
   MuJoCo's `frictionloss`; anything load-dependent is
   `mjcf_unsupported`. The `.asmt` export does not carry friction.
 
+## 5b. Contact and impact
+
+`ForceElement::Contact` is penalty contact between two primitives placed by
+markers (`ContactGeometry`): a point, a sphere, a capsule, a box or a
+plane. The modelled pairs are point / sphere / capsule against each other,
+and point / sphere / capsule / box against a plane — mesh and B-rep
+contact belong in your code, which can map its geometry onto these
+primitives (a ball to a sphere, a shaft to a capsule, a table to a plane).
+An unmodelled pair is `contact_unsupported`.
+
+- **Normal force** (`Impact`, Adams' `IMPACT`):
+  `max(0, k·dᵉ + c·ḋ·STEP(d, 0, 0, d_damp, 1))` per contact point of
+  penetration `d`. `exponent` is the local deformation law (3/2 for
+  Hertzian spheres, 1.1–2.2 in practice), the damping ramps in over
+  `damping_depth` so first touch is continuous, and the force is clamped
+  at zero so a contact never pulls. `Impact::default()` is the Adams
+  default set in SI.
+- **Friction** (`ContactFriction`, optional): regularized Coulomb in the
+  contact plane, the same Stribeck curve as joint friction (§5a).
+- **Contact points per pair are fixed**: one for two swept shapes (their
+  closest pair), one for a sphere or point against a plane, two for a
+  capsule against a plane (its end spheres — a capsule lying flat rests on
+  both), eight for a box (its corners). Points carrying nothing are
+  reported too, so an element's indices mean the same thing in every
+  frame. `DynamicFrame::contacts(&sys)` reports penetration, normal force,
+  slip and friction force per point.
+- **Energy**: the penalty's stored deformation `k·d^(e+1)/(e+1)` is part of
+  `Energy::elastic`, so the audit balances through an impact; the damping
+  and friction are dissipative and show up in `power()`.
+- **Step size**: a stiff contact is what sizes the step. On a bouncing
+  ball at `k = 1e8` the worst energy error over three bounces is 1.3e-2 at
+  the default `error_tol` (1e-6), 4.2e-4 at **1e-8** (the recommended
+  figure for contact work) and 2.5e-5 at 1e-10. Use the softest stiffness
+  your application tolerates, and tighten the tolerance rather than
+  reaching for α.
+- Exports: contact has no MJCF counterpart in this crate's export (MuJoCo's
+  soft contact is a different model), so a system with contact is
+  `mjcf_unsupported`.
+
 ## 6. Redundancy
 
 Real assemblies are over-constrained (a planar linkage built from 3D
@@ -183,6 +222,7 @@ codes are stable strings (`codes::*`):
 | `state_mismatch` | a state or multipliers from another system |
 | `friction_unsupported` | friction on a joint kind without a friction model, or two friction elements on one joint |
 | `friction_not_converged` | the friction load and the reaction it reads never settled |
+| `contact_unsupported` | a contact between two geometries with no contact model |
 | `asmt_unsupported` / `mjcf_unsupported` | the OndselSolver `.asmt` / MuJoCo MJCF export cannot represent the input |
 
 ## 8. Determinism and serialization
@@ -200,7 +240,7 @@ exact float round trips through JSON.
 2. Two markers per mate at the mate frame, each in its own body's frame;
    pick the `JointKind` per §3.
 3. Motors → `Driver`s; springs, loads, gravity → force elements; bearing
-   friction → `JointFriction` (§5a).
+   friction → `JointFriction` (§5a); contact → `Contact` (§5b).
 4. `sys.validate()` and surface `MbdError` codes to your users.
 5. Describe the analysis as a `Study`, `run_study`, map `StudyResult` back
    onto your parts and mates (keep your own id lookup, as the sample's

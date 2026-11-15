@@ -10,7 +10,48 @@
   validation gates; serde golden round-trip tests.
 - Dependency on `rcad-gcs` declared for the M1 position-level solver.
 
-## Unreleased (M1 + M1.5 + M2 + M3 + M4 complete, performance channel, Tier C, M5-1 joint friction)
+## Unreleased (M1 + M1.5 + M2 + M3 + M4 complete, performance channel, Tier C, M5-1 joint friction, M5-2 contact)
+
+### M5-2 — contact and impact
+
+- `ForceElement::Contact` (new `contact` module): penalty contact between
+  primitives placed by markers (`ContactGeometry`: point, sphere, capsule,
+  box, plane). Modelled pairs are point / sphere / capsule against each
+  other and point / sphere / capsule / box against a plane; anything else
+  is the new `contact_unsupported`. Mesh and B-rep contact stay with the
+  consumer, which maps its geometry onto these primitives.
+- Normal force (`Impact`, the Adams `IMPACT` form):
+  `max(0, k·d^e + c·ḋ·STEP(d, 0, 0, d_damp, 1))` per contact point — the
+  damping ramps in so first touch is continuous, and the clamp means a
+  contact never pulls. `Impact::default()` is Adams' default set in SI.
+  Tangential: optional `ContactFriction`, regularized Coulomb on the slip
+  in the contact plane, sharing M5-1's Stribeck curve.
+- Contact points per pair are fixed and stable across frames: the closest
+  pair for two swept shapes, one for a sphere or point on a plane, two for
+  a capsule on a plane (its end spheres), eight for a box (its corners).
+  `DynamicFrame::contacts(&sys)` reports penetration, closing speed,
+  normal force, slip and friction force per point (`ContactLoad`),
+  including points that carry nothing.
+- `energy()` counts the penalty's stored deformation
+  `k·d^(e+1)/(e+1)` as elastic energy, so the audit balances through an
+  impact; the damping and friction are dissipative and show up in
+  `power()`.
+- Contact is not exported to MJCF (MuJoCo's soft contact is a different
+  model): `mjcf_unsupported`.
+- Tier A: `tests/contact_benchmarks.rs` (14 tests) — Hertzian peak
+  penetration, restitution, energy and impulse; the linear contact's
+  `π·√(m/k)` duration; damping lowering the restitution; resting
+  penetration under gravity for a sphere, a box and a capsule; two
+  spheres' momentum and restitution; a sliding box's `μ·g`; crossed
+  capsules; a point as a zero-radius sphere; a bouncing ball under error
+  control; separation leaving the trajectory and the integrator statistics
+  bit-identical; the data gates and the document form.
+- Note for callers: a stiff contact sizes the step. On a bouncing ball at
+  `k = 1e8` the worst energy error over three bounces is 1.3e-2 at the
+  default `error_tol` (1e-6), 4.2e-4 at 1e-8 and 2.5e-5 at 1e-10 — see
+  `docs/INTEGRATING.md` §5b.
+- Docs: two stray table rows that slipped into the top of `ROADMAP.md`
+  with the M5-1 commit are removed.
 
 ### M5-1 — joint friction
 
