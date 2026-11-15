@@ -100,8 +100,8 @@ pub struct Joint {
     pub suppressed: bool,
 }
 
-/// Write one joint's constraint residual jets into `out`; returns the count
-/// (= [`JointKind::constraint_count`]).
+/// Append one joint's constraint residual jets to `out`
+/// ([`JointKind::constraint_count`] of them).
 ///
 /// The formulations, over the world frames of the two markers (`dp = p2 −
 /// p1`, axes `x1 y1 z1` / `x2 y2 z2`); every row is a dot product, so its
@@ -124,7 +124,7 @@ pub struct Joint {
 /// commercial solvers): the axis and orientation rows are also satisfied by
 /// the 180°-flipped configurations, so a seed far from the authored pose may
 /// converge to a flipped assembly.
-pub(crate) fn joint_rows(kind: JointKind, f1: &FrameJet, f2: &FrameJet, out: &mut [Jet]) -> usize {
+pub(crate) fn joint_rows(kind: JointKind, f1: &FrameJet, f2: &FrameJet, out: &mut Vec<Jet>) {
     let dp = f2.p - f1.p;
     let rows: &[Jet] = match kind {
         JointKind::Revolute => &[
@@ -164,8 +164,7 @@ pub(crate) fn joint_rows(kind: JointKind, f1: &FrameJet, f2: &FrameJet, out: &mu
         JointKind::ParallelAxes => &[f1.x.dot(f2.z), f1.y.dot(f2.z)],
         JointKind::Perpendicular => &[f1.z.dot(f2.z)],
     };
-    out[..rows.len()].copy_from_slice(rows);
-    rows.len()
+    out.extend_from_slice(rows);
 }
 
 /// The joint coordinate a driver slot measures, as a jet: the rotation angle

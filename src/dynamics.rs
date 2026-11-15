@@ -29,8 +29,8 @@
 //! accelerations: dynamics and kinematics share one constraint formulation.
 //!
 //! **Linear solves.** The instantaneous problems are saddle-point systems
-//! `[M Jᵀ; J 0]`, solved by the sparse quasi-definite LDLᵀ ([`crate::sparse`],
-//! O(bodies) for chains and trees) with the dense rank-revealing QR as the
+//! `[M Jᵀ; J 0]`, solved by the sparse saddle-point LDLᵀ ([`crate::sparse`], O(bodies)
+//! for chains and trees) with the dense rank-revealing QR as the
 //! fallback: redundant constraint equations are consistent dependent rows —
 //! their multipliers are not unique; the sparse path removes them
 //! (multiplier 0, the Adams / OndselSolver convention), the dense path
@@ -44,12 +44,14 @@ use glam::{DMat3, DQuat, DVec3};
 use crate::body::{Body, BodyId, MarkerId};
 use crate::error::{codes, MbdError};
 use crate::force::{Argument, ForceElement, Function};
+use crate::driver::DriverSlot;
+use crate::joint::JointId;
 use crate::kinematics::{
-    check_state, describe, position_ic, position_ic_from, read_pose, EquationOwner, EquationRef,
-    KinematicState, Problem, Twist, BODY_PARAMS, BODY_TWIST,
+    check_state, describe, joint_slots, position_ic, position_ic_from, read_pose, EquationRef,
+    KinematicState, Problem, Twist, BODY_TWIST,
 };
-use crate::linalg::RowFactor;
-use crate::sparse::{triplets_from_dense, SaddleFactor, SparseRows, Triplets};
+use crate::linalg::{inf_norm, transpose, RowFactor};
+use crate::sparse::{dense_saddle, triplets_from_dense, SaddleFactor, SparseRows, Triplets};
 use crate::system::System;
 
 /// Below this length (m) a spring's line of action is undefined.
@@ -83,7 +85,7 @@ pub(crate) struct BodyInertia {
 }
 
 impl BodyInertia {
-    pub(crate) fn at(body: &Body, rotation: DQuat) -> Self {
+    fn at(body: &Body, rotation: DQuat) -> Self {
         let r = DMat3::from_quat(rotation);
         Self {
             mass: body.mass_kg,
@@ -112,39 +114,11 @@ impl BodyInertia {
     }
 
     /// The 6×6 mass matrix (rows and columns: linear xyz, angular xyz).
-    pub(crate) fn matrix(&self) -> [[f64; BODY_TWIST]; BODY_TWIST] {
-        let mut m = [[0.0; BODY_TWIST]; BODY_TWIST];
-        for (col, unit) in unit_twists().into_iter().enumerate() {
-            let x = self.apply(unit);
-            for (row, v) in twist_array(x).into_iter().enumerate() {
-                m[row][col] = v;
-            }
-        }
-        m
+    fn matrix(&self) -> [[f64; BODY_TWIST]; BODY_TWIST] {
+        let cols: [[f64; BODY_TWIST]; BODY_TWIST] =
+            std::array::from_fn(|k| self.apply(Twist::unit(k)).to_array());
+        std::array::from_fn(|row| std::array::from_fn(|col| cols[col][row]))
     }
-}
-
-fn unit_twists() -> [Twist; BODY_TWIST] {
-    let mut out = [Twist::default(); BODY_TWIST];
-    for (dir, t) in out.iter_mut().enumerate() {
-        if dir < 3 {
-            t.linear[dir] = 1.0;
-        } else {
-            t.angular[dir - 3] = 1.0;
-        }
-    }
-    out
-}
-
-fn twist_array(t: Twist) -> [f64; BODY_TWIST] {
-    [
-        t.linear.x,
-        t.linear.y,
-        t.linear.z,
-        t.angular.x,
-        t.angular.y,
-        t.angular.z,
-    ]
 }
 
 /// The 6×6 mass matrix of `body` at world orientation `rotation`, about the
@@ -186,7 +160,8 @@ pub struct StaticEquilibrium {
     /// its joint at the prescribed value — the "unknown force" of
     /// Inventor / the static motor load of Creo.
     pub multipliers: Vec<(EquationRef, f64)>,
-    /// Redundant equations (non-unique multipliers; one valid split).
+    /// Redundant equations (non-unique multipliers; the minimum-norm split
+    /// is reported).
     pub redundant: Vec<EquationRef>,
     /// Newton iterations taken.
     pub iterations: usize,
@@ -216,10 +191,8 @@ pub struct Momentum {
 }
 
 /// Per-slot twists from a body-keyed map (missing and grounded: zero).
-pub(crate) fn slot_twists(problem: &Problem, map: &BTreeMap<BodyId, Twist>) -> Vec<Twist> {
-    problem
-        .sys
-        .bodies
+pub(crate) fn slot_twists(sys: &System, map: &BTreeMap<BodyId, Twist>) -> Vec<Twist> {
+    sys.bodies
         .iter()
         .map(|(id, body)| {
             if body.grounded {
@@ -236,34 +209,15 @@ pub(crate) fn flatten(problem: &Problem, twists: &[Twist]) -> Vec<f64> {
     let mut x = vec![0.0; problem.n_cols];
     for (slot, col) in problem.col_of.iter().enumerate() {
         if let Some(base) = col {
-            x[*base..base + BODY_TWIST].copy_from_slice(&twist_array(twists[slot]));
+            x[*base..base + BODY_TWIST].copy_from_slice(&twists[slot].to_array());
         }
     }
     x
 }
 
-/// Advance a pose vector along a tangent increment: translation `+= δv`,
-/// rotation `exp(δω)·R` (the left, world-frame increment matching
-/// [`Twist`]).
-pub(crate) fn retract(problem: &Problem, params: &[f64], delta: &[f64]) -> Vec<f64> {
-    let mut out = params.to_vec();
-    for (slot, col) in problem.col_of.iter().enumerate() {
-        let Some(b) = *col else { continue };
-        let (t, r) = read_pose(params, slot);
-        let t = t + DVec3::new(delta[b], delta[b + 1], delta[b + 2]);
-        let r = (DQuat::from_scaled_axis(DVec3::new(delta[b + 3], delta[b + 4], delta[b + 5])) * r)
-            .normalize();
-        out[slot * BODY_PARAMS..(slot + 1) * BODY_PARAMS]
-            .copy_from_slice(&[t.x, t.y, t.z, r.x, r.y, r.z, r.w]);
-    }
-    out
-}
-
 /// Per-slot inertia (`None` for grounded slots).
-pub(crate) fn inertias(problem: &Problem, params: &[f64]) -> Vec<Option<BodyInertia>> {
-    problem
-        .sys
-        .bodies
+pub(crate) fn inertias(sys: &System, params: &[f64]) -> Vec<Option<BodyInertia>> {
+    sys.bodies
         .values()
         .enumerate()
         .map(|(slot, body)| {
@@ -349,7 +303,7 @@ pub(crate) fn applied_forces(
                 ..
             } => {
                 let f = evaluate(problem, params, vel, magnitude)?;
-                let dir = world_direction(problem, params, *reference, *direction);
+                let dir = world_direction(problem, params, vel, *reference, *direction);
                 let p = problem.frame(params, vel, *marker).p.v;
                 point_force(&mut q, *marker, p, f * dir);
             }
@@ -361,7 +315,7 @@ pub(crate) fn applied_forces(
                 ..
             } => {
                 let t = evaluate(problem, params, vel, magnitude)?;
-                let dir = world_direction(problem, params, *reference, *direction);
+                let dir = world_direction(problem, params, vel, *reference, *direction);
                 let slot = problem.slot_of[&sys.markers[marker].body];
                 q[slot].angular += t * dir;
             }
@@ -447,34 +401,22 @@ pub(crate) fn applied_forces(
 fn coordinate_gradient(
     problem: &Problem,
     params: &[f64],
-    joint: crate::joint::JointId,
-    slot: crate::driver::DriverSlot,
+    joint: JointId,
+    slot: DriverSlot,
 ) -> Vec<(usize, Twist)> {
-    let sys = problem.sys;
-    let j = &sys.joints[&joint];
-    let mut slots = vec![
-        problem.slot_of[&sys.markers[&j.marker1].body],
-        problem.slot_of[&sys.markers[&j.marker2].body],
-    ];
-    slots.dedup();
     let mut motion = vec![Twist::default(); problem.n_bodies()];
     let mut out = Vec::new();
-    for s in slots {
+    for s in joint_slots(problem.sys, &problem.slot_of, joint) {
         if problem.col_of[s].is_none() {
             continue;
         }
-        let mut g = Twist::default();
-        for (dir, unit) in unit_twists().into_iter().enumerate() {
-            motion[s] = unit;
-            let d = problem.coordinate(params, &motion, joint, slot).d;
-            if dir < 3 {
-                g.linear[dir] = d;
-            } else {
-                g.angular[dir - 3] = d;
-            }
+        let mut g = [0.0; BODY_TWIST];
+        for (dir, d) in g.iter_mut().enumerate() {
+            motion[s] = Twist::unit(dir);
+            *d = problem.coordinate(params, &motion, joint, slot).d;
         }
         motion[s] = Twist::default();
-        out.push((s, g));
+        out.push((s, Twist::from_slice(&g)));
     }
     out
 }
@@ -534,13 +476,13 @@ fn bushing_state(
 fn world_direction(
     problem: &Problem,
     params: &[f64],
+    vel: &[Twist],
     reference: Option<MarkerId>,
     direction: DVec3,
 ) -> DVec3 {
     let unit = direction.normalize();
     let Some(r) = reference else { return unit };
-    let rest = vec![Twist::default(); problem.n_bodies()];
-    let f = problem.frame(params, &rest, r);
+    let f = problem.frame(params, vel, r);
     unit.x * f.x.v + unit.y * f.y.v + unit.z * f.z.v
 }
 
@@ -584,7 +526,7 @@ pub fn power(
     sys.validate()?;
     check_state(sys, state)?;
     let problem = Problem::new(sys, time, &state.angles);
-    let vel = slot_twists(&problem, velocity);
+    let vel = slot_twists(sys, velocity);
     let q = flatten(&problem, &applied_forces(&problem, &state.params, &vel)?);
     Ok(q.iter()
         .zip(flatten(&problem, &vel))
@@ -592,49 +534,18 @@ pub fn power(
         .sum())
 }
 
-/// Per-row driver velocity and acceleration (zero for joint and coupler
-/// rows).
-fn driver_levels(problem: &Problem) -> (Vec<f64>, Vec<f64>) {
-    problem
-        .rows
-        .iter()
-        .map(|r| match r.owner {
-            EquationOwner::Driver(i) => {
-                let s = problem.sys.drivers[i].sample(problem.time);
-                (s.velocity, s.acceleration)
-            }
-            EquationOwner::Joint(_) | EquationOwner::Coupler(_) => (0.0, 0.0),
-        })
-        .unzip()
-}
-
-/// Solve the saddle-point system `[A Jᵀ; J 0]·[x; μ] = [top; bottom]`, `A`
-/// given by rows (`n × n`). Returns `(x, μ)`; inconsistent rows fail.
-fn solve_saddle(
-    problem: &Problem,
-    a: &[Vec<f64>],
-    j: &[Vec<f64>],
-    top: &[f64],
-    bottom: &[f64],
-    what: &str,
-) -> Result<(Vec<f64>, Vec<f64>), MbdError> {
-    let j = SparseRows::from_dense(j, problem.n_cols);
-    solve_saddle_full(problem, &triplets_from_dense(a), &j, top, bottom, what).map(|s| (s.x, s.mu))
-}
-
 /// A saddle-point solution with the redundant constraint rows (ascending).
-pub(crate) struct SaddleSolution {
-    pub(crate) x: Vec<f64>,
-    pub(crate) mu: Vec<f64>,
-    pub(crate) redundant: Vec<usize>,
+struct SaddleSolution {
+    x: Vec<f64>,
+    mu: Vec<f64>,
+    redundant: Vec<usize>,
 }
 
-/// [`solve_saddle`] with the redundancy: the sparse quasi-definite
-/// factorization ([`SaddleFactor`]) first; the dense rank-revealing QR when
-/// the sparse path declines (a matrix that is not quasi-definite, an
-/// inconsistent or singular system — the dense path then names the
-/// offending equations).
-fn solve_saddle_full(
+/// Solve the saddle-point system `[A Jᵀ; J 0]·[x; μ] = [top; bottom]` (`A`
+/// as `n × n` triplets): the sparse LDLᵀ ([`SaddleFactor`]) first; the dense
+/// rank-revealing QR when the sparse path declines (an inconsistent or
+/// singular system — the dense path then names the offending equations).
+fn solve_saddle(
     problem: &Problem,
     a: &[(usize, usize, f64)],
     j: &SparseRows,
@@ -652,27 +563,9 @@ fn solve_saddle_full(
         }
     }
     let n = problem.n_cols;
-    let m = j.len();
-    let mut a_dense = vec![vec![0.0; n]; n];
-    for &(r, c, v) in a {
-        a_dense[r][c] += v;
-    }
-    let j = j.to_dense();
-    let j = j.as_slice();
-    let mut rows = Vec::with_capacity(n + m);
-    for (i, a_row) in a_dense.iter().enumerate() {
-        let mut row = a_row.clone();
-        row.extend(j.iter().map(|jr| jr[i]));
-        rows.push(row);
-    }
-    for jr in j {
-        let mut row = jr.clone();
-        row.resize(n + m, 0.0);
-        rows.push(row);
-    }
+    let rows = dense_saddle(n, a, j);
     let rhs: Vec<f64> = top.iter().chain(bottom).copied().collect();
-    let factor = RowFactor::new(&rows, n + m);
-    let (x, conflicts) = factor.solve(&rhs);
+    let (x, conflicts) = RowFactor::new(&rows, rows.len()).solve(&rhs);
     if !conflicts.is_empty() {
         let constraint: Vec<usize> = conflicts
             .iter()
@@ -697,15 +590,16 @@ fn solve_saddle_full(
             "check for a lock-up/toggle position, drivers over-prescribing a degree of freedom, or a free body without inertia",
         ));
     }
-    let (x, mu) = x.split_at(n);
+    let mut x = x;
+    let mu = x.split_off(n);
     Ok(SaddleSolution {
-        x: x.to_vec(),
-        mu: mu.to_vec(),
-        redundant: sorted_dependent(j, n),
+        x,
+        mu,
+        redundant: RowFactor::new(&j.to_dense(), n).dependent_sorted(),
     })
 }
 
-/// The block-diagonal mass matrix as dense rows.
+/// The block-diagonal mass matrix as triplets.
 fn mass_triplets(problem: &Problem, inertia: &[Option<BodyInertia>]) -> Triplets {
     let mut t = Vec::with_capacity(problem.n_cols * BODY_TWIST);
     for (slot, col) in problem.col_of.iter().enumerate() {
@@ -721,12 +615,6 @@ fn mass_triplets(problem: &Problem, inertia: &[Option<BodyInertia>]) -> Triplets
         }
     }
     t
-}
-
-pub(crate) fn sorted_dependent(j: &[Vec<f64>], n: usize) -> Vec<usize> {
-    let mut d = RowFactor::new(j, n).dependent().to_vec();
-    d.sort_unstable();
-    d
 }
 
 /// The forward-dynamics solve: per-slot accelerations, the multipliers and
@@ -745,7 +633,7 @@ pub(crate) fn accelerations(
     params: &[f64],
     vel: &[Twist],
 ) -> Result<Accelerations, MbdError> {
-    let inertia = inertias(problem, params);
+    let inertia = inertias(problem.sys, params);
     let q = applied_forces(problem, params, vel)?;
     let mut top = vec![0.0; problem.n_cols];
     for (slot, col) in problem.col_of.iter().enumerate() {
@@ -757,13 +645,11 @@ pub(crate) fn accelerations(
             linear: q[slot].linear - bias.linear,
             angular: q[slot].angular - bias.angular,
         };
-        top[b..b + BODY_TWIST].copy_from_slice(&twist_array(f));
+        top[b..b + BODY_TWIST].copy_from_slice(&f.to_array());
     }
     let j = problem.jacobian_sparse(params);
-    let (_, s_acc) = driver_levels(problem);
-    let gamma = problem.jets(params, vel);
-    let bottom: Vec<f64> = s_acc.iter().zip(&gamma).map(|(s, g)| s - g.dd).collect();
-    let solution = solve_saddle_full(
+    let bottom = problem.acceleration_rhs(params, vel);
+    let solution = solve_saddle(
         problem,
         &mass_triplets(problem, &inertia),
         &j,
@@ -776,10 +662,6 @@ pub(crate) fn accelerations(
         lambda: solution.mu,
         redundant: solution.redundant,
     })
-}
-
-pub(crate) fn by_body(state: &KinematicState, twists: Vec<Twist>) -> BTreeMap<BodyId, Twist> {
-    state.order.iter().copied().zip(twists).collect()
 }
 
 /// Forward dynamics at one instant: given a pose and velocity satisfying the
@@ -796,21 +678,7 @@ pub fn forward_dynamics(
     sys.validate()?;
     check_state(sys, state)?;
     let problem = Problem::new(sys, time, &state.angles);
-    let vel = slot_twists(&problem, velocity);
-    let Accelerations {
-        acc,
-        lambda,
-        redundant,
-        ..
-    } = accelerations(&problem, &state.params, &vel)?;
-    Ok(DynamicFrame {
-        time,
-        velocity: by_body(state, vel),
-        acceleration: by_body(state, acc),
-        multipliers: problem.rows.iter().copied().zip(lambda).collect(),
-        redundant: problem.refs(&redundant),
-        state: state.clone(),
-    })
+    dynamic_frame(&problem, state, slot_twists(sys, velocity))
 }
 
 /// Project authored body velocities onto the velocity constraints at a
@@ -828,9 +696,9 @@ pub fn velocity_ic(
     sys.validate()?;
     check_state(sys, state)?;
     let problem = Problem::new(sys, time, &state.angles);
-    let v0 = slot_twists(&problem, authored);
+    let v0 = slot_twists(sys, authored);
     let v = project_velocity(&problem, &state.params, &v0, "velocity initial condition")?;
-    Ok(by_body(state, v))
+    Ok(state.by_body(v))
 }
 
 /// The kinetic-energy-norm projection of per-slot velocities onto
@@ -841,16 +709,16 @@ pub(crate) fn project_velocity(
     v0: &[Twist],
     what: &str,
 ) -> Result<Vec<Twist>, MbdError> {
-    let inertia = inertias(problem, params);
+    let inertia = inertias(problem.sys, params);
     let momentum: Vec<Twist> = v0
         .iter()
         .zip(&inertia)
         .map(|(v, i)| i.map_or_else(Twist::default, |i| i.apply(*v)))
         .collect();
     let top = flatten(problem, &momentum);
-    let (s_vel, _) = driver_levels(problem);
+    let (s_vel, _) = problem.driver_levels();
     let j = problem.jacobian_sparse(params);
-    let solution = solve_saddle_full(
+    let solution = solve_saddle(
         problem,
         &mass_triplets(problem, &inertia),
         &j,
@@ -876,18 +744,23 @@ pub(crate) fn output_frame(
         raw_velocity,
         "output velocity projection",
     )?;
-    let Accelerations {
-        acc,
-        lambda,
-        redundant,
-        ..
-    } = accelerations(problem, &state.params, &vel)?;
+    dynamic_frame(problem, state, vel)
+}
+
+/// The frame at a consistent pose and velocity: the forward-dynamics
+/// accelerations and multipliers there.
+fn dynamic_frame(
+    problem: &Problem,
+    state: &KinematicState,
+    vel: Vec<Twist>,
+) -> Result<DynamicFrame, MbdError> {
+    let solved = accelerations(problem, &state.params, &vel)?;
     Ok(DynamicFrame {
         time: problem.time,
-        velocity: by_body(state, vel),
-        acceleration: by_body(state, acc),
-        multipliers: problem.rows.iter().copied().zip(lambda).collect(),
-        redundant: problem.refs(&redundant),
+        velocity: state.by_body(vel),
+        acceleration: state.by_body(solved.acc),
+        multipliers: problem.rows.iter().copied().zip(solved.lambda).collect(),
+        redundant: problem.refs(&solved.redundant),
         state: state.clone(),
     })
 }
@@ -913,10 +786,6 @@ pub fn dynamic_ic(sys: &System, time: f64) -> Result<DynamicFrame, MbdError> {
         .collect();
     let velocity = velocity_ic(sys, time, &state, &authored)?;
     forward_dynamics(sys, time, &state, &velocity)
-}
-
-fn inf_norm(x: &[f64]) -> f64 {
-    x.iter().fold(0.0, |m, v| m.max(v.abs()))
 }
 
 /// `Q − Jᵀλ` at rest (the static force imbalance), with the Jacobian.
@@ -978,14 +847,13 @@ pub fn static_equilibrium(
             state.normalize_quaternions();
             state.angles = problem.track_angles(&state.params);
             // Report the minimum-norm multipliers at the converged pose.
-            let jt: Vec<Vec<f64>> = (0..n).map(|c| j.iter().map(|r| r[c]).collect()).collect();
             let rest = vec![Twist::default(); problem.n_bodies()];
             let q = flatten(&problem, &applied_forces(&problem, &state.params, &rest)?);
-            let (lambda, _) = RowFactor::new(&jt, m).solve(&q);
+            let (lambda, _) = RowFactor::new(&transpose(&j, n), m).solve(&q);
             return Ok(StaticEquilibrium {
                 time,
                 multipliers: problem.rows.iter().copied().zip(lambda).collect(),
-                redundant: problem.refs(&sorted_dependent(&j, n)),
+                redundant: problem.refs(&RowFactor::new(&j, n).dependent_sorted()),
                 iterations: iteration,
                 state,
             });
@@ -995,17 +863,24 @@ pub fn static_equilibrium(
         let mut delta = vec![0.0; n];
         for c in 0..n {
             delta[c] = STIFFNESS_STEP;
-            let (fp, _) = static_imbalance(&problem, &retract(&problem, &params, &delta), &lambda)?;
+            let (fp, _) = static_imbalance(&problem, &problem.retract(&params, &delta), &lambda)?;
             delta[c] = -STIFFNESS_STEP;
-            let (fm, _) = static_imbalance(&problem, &retract(&problem, &params, &delta), &lambda)?;
+            let (fm, _) = static_imbalance(&problem, &problem.retract(&params, &delta), &lambda)?;
             delta[c] = 0.0;
             for (row, (p, q)) in k.iter_mut().zip(fp.iter().zip(&fm)) {
                 row[c] = -(p - q) / (2.0 * STIFFNESS_STEP);
             }
         }
         let neg_phi: Vec<f64> = phi.iter().map(|v| -v).collect();
-        let (mut step, mut dl) =
-            solve_saddle(&problem, &k, &j, &f, &neg_phi, "static equilibrium")?;
+        let solution = solve_saddle(
+            &problem,
+            &triplets_from_dense(&k),
+            &SparseRows::from_dense(&j, n),
+            &f,
+            &neg_phi,
+            "static equilibrium",
+        )?;
+        let (mut step, mut dl) = (solution.x, solution.mu);
         // Limit the per-body rotation of one step.
         let mut biggest: f64 = 0.0;
         for b in problem.col_of.iter().flatten() {
@@ -1021,7 +896,7 @@ pub fn static_equilibrium(
         let mut scale = 1.0;
         for _ in 0..12 {
             let trial_step: Vec<f64> = step.iter().map(|v| v * scale).collect();
-            let trial = retract(&problem, &params, &trial_step);
+            let trial = problem.retract(&params, &trial_step);
             let trial_lambda: Vec<f64> =
                 lambda.iter().zip(&dl).map(|(l, d)| l + scale * d).collect();
             let (tf, _) = static_imbalance(&problem, &trial, &trial_lambda)?;
@@ -1067,13 +942,13 @@ pub fn energy(
 ) -> Result<Energy, MbdError> {
     check_state(sys, state)?;
     let problem = Problem::new(sys, 0.0, &state.angles);
-    let vel = slot_twists(&problem, velocity);
+    let vel = slot_twists(sys, velocity);
     let params = &state.params;
     let mut e = Energy::default();
     for (slot, (body, i)) in sys
         .bodies
         .values()
-        .zip(inertias(&problem, params))
+        .zip(inertias(sys, params))
         .enumerate()
     {
         let (t, r) = read_pose(params, slot);
@@ -1114,10 +989,10 @@ pub fn energy(
                 }
                 // The tracked (unwrapped) angle for rotation.
                 let q = match slot {
-                    crate::driver::DriverSlot::Rotation => {
+                    DriverSlot::Rotation => {
                         state.joint_angle(*joint).unwrap_or_default()
                     }
-                    crate::driver::DriverSlot::Translation => {
+                    DriverSlot::Translation => {
                         problem.coordinate(params, &rest, *joint, *slot).v
                     }
                 };
@@ -1149,10 +1024,9 @@ pub fn momentum(
     velocity: &BTreeMap<BodyId, Twist>,
 ) -> Result<Momentum, MbdError> {
     check_state(sys, state)?;
-    let problem = Problem::new(sys, 0.0, &state.angles);
-    let vel = slot_twists(&problem, velocity);
+    let vel = slot_twists(sys, velocity);
     let mut out = Momentum::default();
-    for (slot, i) in inertias(&problem, &state.params).into_iter().enumerate() {
+    for (slot, i) in inertias(sys, &state.params).into_iter().enumerate() {
         let Some(i) = i else { continue };
         let origin = read_pose(&state.params, slot).0;
         let p = i.apply(vel[slot]);
@@ -1196,10 +1070,7 @@ mod tests {
         }
         let v = DVec3::new(0.3, -1.2, 0.7);
         let w = DVec3::new(-0.8, 0.5, 1.9);
-        let x = twist_array(Twist {
-            linear: v,
-            angular: w,
-        });
+        let x = Twist { linear: v, angular: w }.to_array();
         let quad: f64 = (0..6)
             .map(|i| (0..6).map(|k| x[i] * m[i][k] * x[k]).sum::<f64>())
             .sum();

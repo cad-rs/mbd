@@ -1,5 +1,6 @@
 //! Kinematic solving: the position initial condition, the velocity level and
-//! the acceleration level (M1), and the time sweep over them.
+//! the acceleration level, and the time sweep over them; and `Problem`,
+//! the equation layout every solver evaluates.
 //!
 //! **Coordinates.** The position state is a flat parameter vector: per body,
 //! translation (3) + quaternion (4) = 7 slots. The velocity and acceleration
@@ -9,9 +10,10 @@
 //! redundancy. This is the crate-wide convention (roadmap §3).
 //!
 //! **Equations.** Per joint, the joint equations; per driver, the
-//! prescribed joint coordinate. The position IC adds one unit-norm equation
-//! per body (the quaternion manifold) and solves on the shared `rcad-gcs`
-//! Newton core. The velocity and acceleration levels are linear solves
+//! prescribed joint coordinate. The position IC is a minimum-norm Newton on
+//! the tangent space (rotations retracted, so no unit-norm equations), with
+//! the dense `rcad-gcs` Newton as the fallback. The velocity and
+//! acceleration levels are linear solves
 //! against the analytic tangent-space Jacobian, which comes from the same
 //! residual code evaluated on second-order jets ([`crate::jet`]), so the
 //! position residuals, the Jacobian and the quadratic term `γ` cannot drift
@@ -19,9 +21,10 @@
 //!
 //! **Redundancy.** Real CAD assemblies are over-constrained (a planar
 //! four-bar built from 3D revolutes carries three redundant equations).
-//! Every linear solve goes through a rank-revealing factorization:
-//! dependent but consistent equations are reported as redundant and
-//! skipped; dependent inconsistent ones are conflicts and fail as data.
+//! The linear solves go through the sparse saddle factorization
+//! ([`crate::sparse`]) with the dense rank-revealing QR as the diagnosing
+//! fallback: dependent but consistent equations are reported as redundant
+//! and skipped; dependent inconsistent ones are conflicts and fail as data.
 //!
 //! **Angles.** A rotation driver's residual is the measured angle minus the
 //! prescribed one wrapped into `[−π, π)`, so a motor may run any number of
@@ -38,7 +41,7 @@ use crate::error::{codes, MbdError};
 use crate::jet::{BodyMotion, FrameJet, Jet};
 use crate::driver::DriverSlot;
 use crate::joint::{joint_coordinate, joint_rows, JointId};
-use crate::linalg::RowFactor;
+use crate::linalg::{inf_norm, RowFactor};
 use crate::sparse::{SaddleFactor, SparseRows, Triplets};
 use crate::system::System;
 use crate::coupler::{Coupler, CouplerId};
@@ -116,10 +119,13 @@ impl KinematicState {
         let Some(&slot) = self.slot_of.get(&body) else {
             return false;
         };
-        let base = slot * BODY_PARAMS;
-        self.params[base..base + BODY_PARAMS]
-            .copy_from_slice(&pose_params(translation, rotation.normalize()));
+        write_pose(&mut self.params, slot, translation, rotation.normalize());
         true
+    }
+
+    /// Per-slot twists keyed by body.
+    pub(crate) fn by_body(&self, twists: Vec<Twist>) -> BTreeMap<BodyId, Twist> {
+        self.order.iter().copied().zip(twists).collect()
     }
 
     /// A body-fixed point (body-frame coordinates) in the world frame.
@@ -141,14 +147,18 @@ impl KinematicState {
     pub(crate) fn normalize_quaternions(&mut self) {
         for slot in 0..self.order.len() {
             let (t, r) = read_pose(&self.params, slot);
-            let base = slot * BODY_PARAMS;
-            self.params[base..base + BODY_PARAMS].copy_from_slice(&pose_params(t, r));
+            write_pose(&mut self.params, slot, t, r);
         }
     }
 }
 
-pub(crate) fn pose_params(t: DVec3, r: DQuat) -> [f64; BODY_PARAMS] {
+fn pose_params(t: DVec3, r: DQuat) -> [f64; BODY_PARAMS] {
     [t.x, t.y, t.z, r.x, r.y, r.z, r.w]
+}
+
+/// Write a pose into a slot (the quaternion as given).
+pub(crate) fn write_pose(params: &mut [f64], slot: usize, t: DVec3, r: DQuat) {
+    params[slot * BODY_PARAMS..(slot + 1) * BODY_PARAMS].copy_from_slice(&pose_params(t, r));
 }
 
 pub(crate) fn read_pose(params: &[f64], slot: usize) -> (DVec3, DQuat) {
@@ -181,37 +191,8 @@ fn marker_frame(
     body.frame(m.translation, m.rotation)
 }
 
-/// A joint coordinate with rate and acceleration at a solved frame (the
-/// measure behind [`KinematicFrame::joint_coordinate`]): the jet along the
-/// frame's velocities gives the rate and the velocity-quadratic part, the
-/// jet along its accelerations the linear part `J·q̈`.
-pub(crate) fn coordinate_motion(
-    sys: &System,
-    frame: &KinematicFrame,
-    joint: JointId,
-    slot: DriverSlot,
-) -> Option<crate::measure::JointMotion> {
-    let state = &frame.state;
-    if !state.order.iter().eq(sys.bodies.keys()) {
-        return None;
-    }
-    let vel: Vec<Twist> = state.order.iter().map(|id| frame.velocity[id]).collect();
-    let acc: Vec<Twist> = state.order.iter().map(|id| frame.acceleration[id]).collect();
-    let jv = coordinate_jet(sys, &state.slot_of, &state.params, &vel, joint, slot);
-    let ja = coordinate_jet(sys, &state.slot_of, &state.params, &acc, joint, slot);
-    let value = match slot {
-        DriverSlot::Rotation => state.angles.get(&joint).copied().unwrap_or(jv.v),
-        DriverSlot::Translation => jv.v,
-    };
-    Some(crate::measure::JointMotion {
-        value,
-        velocity: jv.d,
-        acceleration: jv.dd + ja.d,
-    })
-}
-
 /// A joint coordinate as a jet (raw: rotation in `(−π, π]`).
-fn coordinate_jet(
+pub(crate) fn coordinate_jet(
     sys: &System,
     slot_of: &BTreeMap<BodyId, usize>,
     params: &[f64],
@@ -238,6 +219,32 @@ impl Twist {
     /// origin) for a velocity twist: `v + ω × arm`.
     pub fn point_velocity(&self, arm: DVec3) -> DVec3 {
         self.linear + self.angular.cross(arm)
+    }
+
+    /// The unit twist along tangent direction `dir` (0–2 linear, 3–5
+    /// angular).
+    pub(crate) fn unit(dir: usize) -> Twist {
+        let mut t = Twist::default();
+        if dir < 3 {
+            t.linear[dir] = 1.0;
+        } else {
+            t.angular[dir - 3] = 1.0;
+        }
+        t
+    }
+
+    /// `[vx, vy, vz, wx, wy, wz]`.
+    pub(crate) fn to_array(self) -> [f64; BODY_TWIST] {
+        let (v, w) = (self.linear, self.angular);
+        [v.x, v.y, v.z, w.x, w.y, w.z]
+    }
+
+    /// From six tangent coordinates.
+    pub(crate) fn from_slice(x: &[f64]) -> Twist {
+        Twist {
+            linear: DVec3::new(x[0], x[1], x[2]),
+            angular: DVec3::new(x[3], x[4], x[5]),
+        }
     }
 }
 
@@ -294,10 +301,10 @@ pub struct KinematicFrame {
     pub redundant: Vec<EquationRef>,
 }
 
-/// The number of equations the position IC solves for a system: one
-/// unit-norm equation per body, the joint equations, one per coupler and
-/// one per driver (suppressed joints drop out with their couplers and
-/// drivers).
+/// The number of equations of the dense position solve (the `rcad-gcs`
+/// fallback): one unit-norm equation per body, the joint equations, one per
+/// coupler and one per driver (suppressed joints drop out with their
+/// couplers and drivers).
 pub fn equation_count(sys: &System) -> usize {
     sys.bodies.len() + constraint_layout(sys).len()
 }
@@ -379,8 +386,8 @@ fn wrap_angle(a: f64) -> f64 {
     (a + PI).rem_euclid(TAU) - PI
 }
 
-/// The kinematic problem at a driver time: the system plus the slot and
-/// equation layouts.
+/// A system at one time: the slot and equation layouts every solver
+/// (kinematic, dynamic, static, reactions) evaluates its equations on.
 pub(crate) struct Problem<'a> {
     pub(crate) sys: &'a System,
     pub(crate) slot_of: BTreeMap<BodyId, usize>,
@@ -388,17 +395,15 @@ pub(crate) struct Problem<'a> {
     pub(crate) col_of: Vec<Option<usize>>,
     pub(crate) n_cols: usize,
     pub(crate) rows: Vec<EquationRef>,
-    /// Joint + coupler rows (the mechanism, contiguous at the front).
-    pub(crate) n_mechanism_rows: usize,
     pub(crate) time: f64,
     /// Unwrapping references for rotation coordinates (the seed's tracked
     /// angles).
-    pub(crate) refs: BTreeMap<JointId, f64>,
+    refs: BTreeMap<JointId, f64>,
     /// Rotation coordinates prescribed by a driver: the driver index (its
     /// value is the unwrapping reference).
-    pub(crate) rotation_driver: BTreeMap<JointId, usize>,
+    rotation_driver: BTreeMap<JointId, usize>,
     /// Authored values of every coordinate a coupler uses.
-    pub(crate) authored: BTreeMap<(JointId, DriverSlot), f64>,
+    authored: BTreeMap<(JointId, DriverSlot), f64>,
     /// The rows grouped by owner (contiguous), with the body slots each
     /// owner's equations depend on.
     pub(crate) groups: Vec<RowGroup>,
@@ -420,9 +425,6 @@ impl<'a> Problem<'a> {
         }
         let rows = constraint_layout(sys);
         let groups = row_groups(sys, &slot_of, &rows);
-        let count = |f: fn(&EquationOwner) -> bool| rows.iter().filter(|r| f(&r.owner)).count();
-        let n_joint_rows = count(|o| matches!(o, EquationOwner::Joint(_)));
-        let n_mechanism_rows = n_joint_rows + count(|o| matches!(o, EquationOwner::Coupler(_)));
         let rotation_driver = sys
             .drivers
             .iter()
@@ -436,19 +438,23 @@ impl<'a> Problem<'a> {
             col_of,
             n_cols,
             rows,
-            n_mechanism_rows,
             time,
             refs: refs.clone(),
             rotation_driver,
             authored: BTreeMap::new(),
             groups,
         };
-        let authored_state = KinematicState::from_system(sys);
+        // The authored poses (what the coupler offsets are measured from).
+        let authored_params: Vec<f64> = sys
+            .bodies
+            .values()
+            .flat_map(|b| pose_params(b.translation, b.rotation))
+            .collect();
         let rest = vec![Twist::default(); problem.n_bodies()];
         let mut authored = BTreeMap::new();
         for coupler in sys.couplers.values().filter(|c| coupler_active(sys, c)) {
             for term in &coupler.terms {
-                let raw = problem.raw(&authored_state.params, &rest, term.joint, term.slot);
+                let raw = problem.raw(&authored_params, &rest, term.joint, term.slot);
                 authored.insert((term.joint, term.slot), raw.v);
             }
         }
@@ -518,11 +524,9 @@ impl<'a> Problem<'a> {
         match owner {
             EquationOwner::Joint(id) => {
                 let joint = &self.sys.joints[&id];
-                let mut buf = [Jet::default(); 6];
                 let f1 = self.frame(params, motion, joint.marker1);
                 let f2 = self.frame(params, motion, joint.marker2);
-                let n = joint_rows(joint.kind, &f1, &f2, &mut buf);
-                out.extend_from_slice(&buf[..n]);
+                joint_rows(joint.kind, &f1, &f2, out);
             }
             EquationOwner::Coupler(id) => {
                 let mut sum = Jet::default();
@@ -584,19 +588,18 @@ impl<'a> Problem<'a> {
         fixed
     }
 
-    /// The analytic tangent-space Jacobian (rows × 6·free bodies): column
-    /// `c` is the rate of every row under a unit motion in coordinate `c`.
-    ///
-    /// Each owner's rows depend on its own bodies only, so a column of body
-    /// `s` is evaluated for the owners touching `s` alone: O(rows) jets
-    /// instead of O(rows × coordinates) (the values are the same, entry for
-    /// entry, as evaluating every row along every unit motion).
+    /// [`Problem::jacobian_sparse`] as dense rows (the QR fallback and the
+    /// diagnostic paths).
     pub(crate) fn jacobian(&self, params: &[f64]) -> Vec<Vec<f64>> {
         self.jacobian_sparse(params).to_dense()
     }
 
-    /// [`Problem::jacobian`] as sparse rows (the non-zero entries, columns
-    /// ascending).
+    /// The analytic tangent-space Jacobian (rows × 6·free bodies) as sparse
+    /// rows (non-zero entries, columns ascending): column `c` is the rate of
+    /// every row under a unit motion in coordinate `c`. Each owner's rows
+    /// depend on its own bodies only, so a column of body `s` is evaluated
+    /// for the owners touching `s` alone: O(rows) jets instead of O(rows ×
+    /// coordinates), the same values entry for entry.
     pub(crate) fn jacobian_sparse(&self, params: &[f64]) -> SparseRows {
         let mut rows: Vec<Vec<(usize, f64)>> = vec![Vec::new(); self.rows.len()];
         let mut motion = vec![Twist::default(); self.n_bodies()];
@@ -605,13 +608,7 @@ impl<'a> Problem<'a> {
             for &slot in &group.slots {
                 let Some(base) = self.col_of[slot] else { continue };
                 for dir in 0..BODY_TWIST {
-                    let mut unit = Twist::default();
-                    if dir < 3 {
-                        unit.linear[dir] = 1.0;
-                    } else {
-                        unit.angular[dir - 3] = 1.0;
-                    }
-                    motion[slot] = unit;
+                    motion[slot] = Twist::unit(dir);
                     buf.clear();
                     self.owner_jets(params, &motion, group.owner, &mut buf);
                     for (r, jet) in buf.iter().enumerate() {
@@ -638,13 +635,7 @@ impl<'a> Problem<'a> {
         for slot in 0..self.n_bodies() {
             let Some(base) = self.col_of[slot] else { continue };
             for dir in 0..BODY_TWIST {
-                let mut unit = Twist::default();
-                if dir < 3 {
-                    unit.linear[dir] = 1.0;
-                } else {
-                    unit.angular[dir - 3] = 1.0;
-                }
-                motion[slot] = unit;
+                motion[slot] = Twist::unit(dir);
                 for (row, jet) in j.iter_mut().zip(self.jets(params, &motion)) {
                     row[base + dir] = jet.d;
                 }
@@ -658,18 +649,56 @@ impl<'a> Problem<'a> {
     pub(crate) fn twists(&self, x: &[f64]) -> Vec<Twist> {
         self.col_of
             .iter()
-            .map(|col| match col {
-                None => Twist::default(),
-                Some(b) => Twist {
-                    linear: DVec3::new(x[*b], x[b + 1], x[b + 2]),
-                    angular: DVec3::new(x[b + 3], x[b + 4], x[b + 5]),
-                },
-            })
+            .map(|col| col.map_or_else(Twist::default, |b| Twist::from_slice(&x[b..b + BODY_TWIST])))
             .collect()
     }
 
     pub(crate) fn refs(&self, indices: &[usize]) -> Vec<EquationRef> {
         indices.iter().map(|&k| self.rows[k]).collect()
+    }
+
+    /// Per-row driver velocity and acceleration at the problem's time (zero
+    /// for joint and coupler rows).
+    pub(crate) fn driver_levels(&self) -> (Vec<f64>, Vec<f64>) {
+        self.rows
+            .iter()
+            .map(|r| match r.owner {
+                EquationOwner::Driver(i) => {
+                    let s = self.sys.drivers[i].sample(self.time);
+                    (s.velocity, s.acceleration)
+                }
+                EquationOwner::Joint(_) | EquationOwner::Coupler(_) => (0.0, 0.0),
+            })
+            .unzip()
+    }
+
+    /// The acceleration-level right side `s̈ − γ(q, v)`.
+    pub(crate) fn acceleration_rhs(&self, params: &[f64], vel: &[Twist]) -> Vec<f64> {
+        let (_, s_acc) = self.driver_levels();
+        s_acc
+            .iter()
+            .zip(self.jets(params, vel))
+            .map(|(s, g)| s - g.dd)
+            .collect()
+    }
+
+    /// Advance a pose vector along a tangent increment: translation `+= δv`,
+    /// rotation `exp(δω)·R` (the left, world-frame increment matching
+    /// [`Twist`]).
+    pub(crate) fn retract(&self, params: &[f64], delta: &[f64]) -> Vec<f64> {
+        let mut out = params.to_vec();
+        for (slot, col) in self.col_of.iter().enumerate() {
+            let Some(b) = *col else { continue };
+            let d = Twist::from_slice(&delta[b..b + BODY_TWIST]);
+            let (t, r) = read_pose(params, slot);
+            write_pose(
+                &mut out,
+                slot,
+                t + d.linear,
+                (DQuat::from_scaled_axis(d.angular) * r).normalize(),
+            );
+        }
+        out
     }
 
     fn diagnose(&self, params: &[f64]) -> KinematicDiagnosis {
@@ -679,14 +708,18 @@ impl<'a> Problem<'a> {
         let step: Vec<f64> = r.iter().map(|v| -v).collect();
         let factor = RowFactor::new(&j, self.n_cols);
         let (_, conflicts) = factor.solve(&step);
-        let mut redundant: Vec<usize> = factor
-            .dependent()
-            .iter()
-            .copied()
+        let redundant: Vec<usize> = factor
+            .dependent_sorted()
+            .into_iter()
             .filter(|k| !conflicts.contains(k))
             .collect();
-        redundant.sort_unstable();
-        let joint_rank = RowFactor::new(&j[..self.n_mechanism_rows], self.n_cols).rank();
+        // The mechanism (joint and coupler rows) comes before the drivers.
+        let n_mechanism = self
+            .rows
+            .iter()
+            .filter(|r| !matches!(r.owner, EquationOwner::Driver(_)))
+            .count();
+        let joint_rank = RowFactor::new(&j[..n_mechanism], self.n_cols).rank();
         KinematicDiagnosis {
             coordinates: self.n_cols,
             rank: factor.rank(),
@@ -757,8 +790,9 @@ pub(crate) fn check_state(sys: &System, state: &KinematicState) -> Result<(), Mb
 /// satisfying every joint equation and every driver value, starting from the
 /// system's authored poses.
 ///
-/// The solve is a damped Newton-Raphson on the shared `rcad-gcs` numerics
-/// core. Failure to converge is data ([`codes::KINEMATICS_NOT_CONVERGED`],
+/// The solve is a minimum-norm Newton on the tangent space through the
+/// sparse saddle factorization, with the dense `rcad-gcs` Newton as the
+/// fallback. Failure to converge is data ([`codes::KINEMATICS_NOT_CONVERGED`],
 /// naming the conflicting equations when the linearization shows any),
 /// never a panic. Free degrees of freedom are allowed (an assembly solve).
 pub fn position_ic(sys: &System, time: f64) -> Result<KinematicState, MbdError> {
@@ -787,28 +821,32 @@ const POSITION_TARGET: f64 = 1.0e-13;
 const POSITION_ACCEPT: f64 = 1.0e-10;
 const POSITION_MAX_ITER: usize = 60;
 
+/// The minimum-norm factorization of `J` (`[I Jᵀ; J 0]`): `J·x = b` solved
+/// for the minimum-norm `x`, redundant rows removed.
+fn min_norm_factor(j: &SparseRows) -> Option<SaddleFactor> {
+    let identity: Triplets = (0..j.n_cols).map(|i| (i, i, 1.0)).collect();
+    SaddleFactor::new(j.n_cols, &identity, j)
+}
+
 /// The sparse minimum-norm Newton on the tangent space: each step solves
-/// `J·Δ = −Φ` for the minimum-norm `Δ` through the regularized
-/// `[I Jᵀ; J −δI]` (a least-squares step where redundant rows disagree off
-/// the solution) and retracts it, with backtracking on `|Φ|∞`. `false`
-/// when it cannot (the caller falls back to the dense `rcad-gcs` Newton,
-/// which also diagnoses).
+/// `J·Δ = −Φ` for the minimum-norm `Δ` (a least-squares step where
+/// redundant rows disagree off the solution) and retracts it, with
+/// backtracking on `|Φ|∞`. `false` when it cannot (the caller falls back to
+/// the dense `rcad-gcs` Newton).
 fn sparse_position(problem: &Problem, params: &mut Vec<f64>) -> bool {
     let n = problem.n_cols;
     let m = problem.rows.len();
-    let inf = |v: &[f64]| v.iter().fold(0.0_f64, |s, x| s.max(x.abs()));
     let mut phi = vec![0.0; m];
     problem.constraint_residuals(params, &mut phi);
-    let mut norm = inf(&phi);
+    let mut norm = inf_norm(&phi);
     if n == 0 || m == 0 {
         return norm <= POSITION_ACCEPT;
     }
-    let identity: Triplets = (0..n).map(|i| (i, i, 1.0)).collect();
     for _ in 0..POSITION_MAX_ITER {
         if norm <= POSITION_TARGET {
             return true;
         }
-        let Some(factor) = SaddleFactor::new(n, &identity, &problem.jacobian_sparse(params)) else {
+        let Some(factor) = min_norm_factor(&problem.jacobian_sparse(params)) else {
             return false;
         };
         let rhs: Vec<f64> = vec![0.0; n].into_iter().chain(phi.iter().map(|v| -v)).collect();
@@ -817,10 +855,10 @@ fn sparse_position(problem: &Problem, params: &mut Vec<f64>) -> bool {
         let mut accepted = false;
         for _ in 0..30 {
             let step: Vec<f64> = delta[..n].iter().map(|d| d * scale).collect();
-            let trial = crate::dynamics::retract(problem, params, &step);
+            let trial = problem.retract(params, &step);
             let mut tphi = vec![0.0; m];
             problem.constraint_residuals(&trial, &mut tphi);
-            let tnorm = inf(&tphi);
+            let tnorm = inf_norm(&tphi);
             if tnorm < norm {
                 *params = trial;
                 phi = tphi;
@@ -842,28 +880,27 @@ fn solve_position(sys: &System, time: f64, mut state: KinematicState) -> Result<
     let mut params = state.params.clone();
     if sparse_position(&problem, &mut params) {
         state.params = params;
-        state.normalize_quaternions();
-        state.angles = problem.track_angles(&state.params);
-        return Ok(state);
-    }
-    let fixed = problem.fixed_mask();
-    let n_eq = problem.n_bodies() + problem.rows.len();
-    let GcsSolveResult { converged, residual, iterations } =
-        newton_solve(&mut state.params, &fixed, n_eq, |p, out| problem.eval(p, out));
-    if !converged {
-        let diagnosis = problem.diagnose(&state.params);
-        let conflicts = if diagnosis.conflicting.is_empty() {
-            String::new()
-        } else {
-            format!("; conflicting: {}", describe(sys, &diagnosis.conflicting))
-        };
-        return Err(MbdError::new(
-            codes::KINEMATICS_NOT_CONVERGED,
-            format!(
-                "position IC at t = {time} did not converge: rms residual {residual:.3e} after {iterations} iterations{conflicts}"
-            ),
-            "check the joint layout for over-constraint, or seed the bodies closer to a valid configuration",
-        ));
+    } else {
+        // The dense fallback starts again from the seed.
+        let fixed = problem.fixed_mask();
+        let n_eq = problem.n_bodies() + problem.rows.len();
+        let GcsSolveResult { converged, residual, iterations } =
+            newton_solve(&mut state.params, &fixed, n_eq, |p, out| problem.eval(p, out));
+        if !converged {
+            let diagnosis = problem.diagnose(&state.params);
+            let conflicts = if diagnosis.conflicting.is_empty() {
+                String::new()
+            } else {
+                format!("; conflicting: {}", describe(sys, &diagnosis.conflicting))
+            };
+            return Err(MbdError::new(
+                codes::KINEMATICS_NOT_CONVERGED,
+                format!(
+                    "position IC at t = {time} did not converge: rms residual {residual:.3e} after {iterations} iterations{conflicts}"
+                ),
+                "check the joint layout for over-constraint, or seed the bodies closer to a valid configuration",
+            ));
+        }
     }
     state.normalize_quaternions();
     state.angles = problem.track_angles(&state.params);
@@ -893,38 +930,23 @@ pub fn solve_frame(sys: &System, time: f64, seed: Option<&KinematicState>) -> Re
         None => position_ic(sys, time)?,
     };
     let problem = Problem::new(sys, time, &state.angles);
-    let samples: Vec<_> = problem
-        .rows
-        .iter()
-        .map(|r| match r.owner {
-            EquationOwner::Driver(i) => Some(sys.drivers[i].sample(time)),
-            EquationOwner::Joint(_) | EquationOwner::Coupler(_) => None,
-        })
-        .collect();
-    // Sparse path: minimum-norm solves of J·x = b through [I Jᵀ; J −δI];
-    // redundancy from its pivots. Anything it cannot settle (a conflict, a
-    // free degree of freedom) goes to the dense, diagnosing path below.
+    let (b_vel, _) = problem.driver_levels();
+    // Sparse path: minimum-norm solves of J·x = b, redundancy from the
+    // pivots. Anything it cannot settle (a conflict, a free degree of
+    // freedom) goes to the dense, diagnosing path below.
     let n = problem.n_cols;
     if n > 0 {
-        let identity: Triplets = (0..n).map(|i| (i, i, 1.0)).collect();
-        if let Some(factor) = SaddleFactor::new(n, &identity, &problem.jacobian_sparse(&state.params)) {
-            let rank = problem.rows.len() - factor.redundant().len();
-            let zeros = vec![0.0; n];
-            let b_vel: Vec<f64> = samples.iter().map(|s| s.map_or(0.0, |s| s.velocity)).collect();
-            if rank == n {
+        if let Some(factor) = min_norm_factor(&problem.jacobian_sparse(&state.params)) {
+            if problem.rows.len() - factor.redundant().len() == n {
+                let zeros = vec![0.0; n];
                 if let Some((v, _)) = factor.solve(&zeros, &b_vel) {
                     let velocity = problem.twists(&v);
-                    let jets = problem.jets(&state.params, &velocity);
-                    let b_acc: Vec<f64> = samples
-                        .iter()
-                        .zip(&jets)
-                        .map(|(s, jet)| s.map_or(0.0, |s| s.acceleration) - jet.dd)
-                        .collect();
+                    let b_acc = problem.acceleration_rhs(&state.params, &velocity);
                     if let Some((a, _)) = factor.solve(&zeros, &b_acc) {
                         return Ok(KinematicFrame {
                             time,
-                            velocity: state.order.iter().copied().zip(velocity).collect(),
-                            acceleration: state.order.iter().copied().zip(problem.twists(&a)).collect(),
+                            velocity: state.by_body(velocity),
+                            acceleration: state.by_body(problem.twists(&a)),
                             redundant: problem.refs(factor.redundant()),
                             state,
                         });
@@ -940,25 +962,17 @@ pub fn solve_frame(sys: &System, time: f64, seed: Option<&KinematicState>) -> Re
         return Err(MbdError::new(
             codes::UNDERDETERMINED_MOTION,
             format!("the mechanism keeps {free} free degree(s) of freedom at t = {time} after its drivers"),
-            "a kinematic analysis needs every degree of freedom prescribed: add drivers (or run dynamics, M2)",
+            "a kinematic analysis needs every degree of freedom prescribed: add drivers (or run dynamics)",
         ));
     }
-    let b_vel: Vec<f64> = samples.iter().map(|s| s.map_or(0.0, |s| s.velocity)).collect();
     let velocity = problem.solve_level(&factor, &b_vel, "velocity")?;
-    let jets = problem.jets(&state.params, &velocity);
-    let b_acc: Vec<f64> = samples
-        .iter()
-        .zip(&jets)
-        .map(|(s, jet)| s.map_or(0.0, |s| s.acceleration) - jet.dd)
-        .collect();
+    let b_acc = problem.acceleration_rhs(&state.params, &velocity);
     let acceleration = problem.solve_level(&factor, &b_acc, "acceleration")?;
-    let mut redundant: Vec<usize> = factor.dependent().to_vec();
-    redundant.sort_unstable();
     Ok(KinematicFrame {
         time,
-        velocity: state.order.iter().copied().zip(velocity).collect(),
-        acceleration: state.order.iter().copied().zip(acceleration).collect(),
-        redundant: problem.refs(&redundant),
+        velocity: state.by_body(velocity),
+        acceleration: state.by_body(acceleration),
+        redundant: problem.refs(&factor.dependent_sorted()),
         state,
     })
 }
@@ -989,14 +1003,14 @@ pub fn kinematic_sweep(sys: &System, times: &[f64]) -> Result<Vec<KinematicFrame
 fn predict(prev: &KinematicFrame, time: f64) -> KinematicState {
     let dt = time - prev.time;
     let mut state = prev.state.clone();
-    for id in prev.state.order.clone() {
-        let (t, r) = prev.state.body_pose(id).expect("own body");
-        let v = prev.velocity[&id];
-        let a = prev.acceleration[&id];
+    for (slot, id) in prev.state.order.iter().enumerate() {
+        let (t, r) = read_pose(&prev.state.params, slot);
+        let v = prev.velocity[id];
+        let a = prev.acceleration[id];
         let t = t + v.linear * dt + 0.5 * a.linear * dt * dt;
         let turn = v.angular * dt + 0.5 * a.angular * dt * dt;
         let r = DQuat::from_scaled_axis(turn) * r;
-        state.set_body_pose(id, t, r);
+        state.set_body_pose(*id, t, r);
     }
     state
 }
@@ -1221,9 +1235,8 @@ mod tests {
         let rows = |b1: &BodyMotion, b2: &BodyMotion, kind: JointKind| {
             let f1 = b1.frame(m1.0, m1.1);
             let f2 = b2.frame(m2.0, m2.1);
-            let mut buf = [Jet::default(); 6];
-            let n = joint_rows(kind, &f1, &f2, &mut buf);
-            let mut out = buf[..n].to_vec();
+            let mut out = Vec::new();
+            joint_rows(kind, &f1, &f2, &mut out);
             for slot in [DriverSlot::Rotation, DriverSlot::Translation] {
                 if let Some(j) = joint_coordinate(JointKind::Cylindrical, slot, &f1, &f2) {
                     out.push(j);

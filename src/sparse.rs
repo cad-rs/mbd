@@ -117,7 +117,25 @@ pub(crate) fn triplets_from_dense(rows: &[Vec<f64>]) -> Triplets {
     t
 }
 
+/// The dense rows of `[A Jᵀ; J 0]` (`A` as `n × n` triplets): the dense,
+/// diagnosing fallback of the saddle solves.
+pub(crate) fn dense_saddle(n: usize, a: &[(usize, usize, f64)], j: &SparseRows) -> Vec<Vec<f64>> {
+    let m = j.len();
+    let mut rows = vec![vec![0.0; n + m]; n + m];
+    for &(r, c, v) in a {
+        rows[r][c] += v;
+    }
+    for (k, jr) in j.rows.iter().enumerate() {
+        for &(c, v) in jr {
+            rows[c][n + k] = v;
+            rows[n + k][c] = v;
+        }
+    }
+    rows
+}
+
 /// A symmetric matrix in compressed sparse columns, both triangles stored.
+#[derive(Clone)]
 struct Csc {
     n: usize,
     colp: Vec<usize>,
@@ -155,6 +173,16 @@ impl Csc {
         }
     }
 
+    /// Add `shift` to the first `upto` diagonal entries.
+    fn shift_diagonal(&mut self, upto: usize, shift: f64) {
+        for j in 0..upto {
+            let p = (self.colp[j]..self.colp[j + 1])
+                .find(|&p| self.rowi[p] == j)
+                .expect("diagonal stored");
+            self.vals[p] += shift;
+        }
+    }
+
     fn mul(&self, x: &[f64]) -> Vec<f64> {
         let mut y = vec![0.0; self.n];
         for (j, xj) in x.iter().enumerate() {
@@ -171,7 +199,7 @@ impl Csc {
 /// touches is eliminated; among the eligible nodes the one of least current
 /// degree goes first (ties: lowest index). Every constraint pivot is then
 /// the (negative) Schur complement over bodies already eliminated — well
-/// defined, ≈ −δ exactly for a dependent row — while a chain or a tree
+/// defined, pure rounding for a dependent row — while a chain or a tree
 /// fills in only along its topology. (Eliminating *all* bodies first would
 /// form `J·A⁻¹·Jᵀ`, dense as soon as `A` couples bodies.)
 fn ordering(a: &Csc, first_body_end: usize) -> Vec<usize> {
@@ -239,14 +267,11 @@ fn ordering(a: &Csc, first_body_end: usize) -> Vec<usize> {
                 queued[r] = true;
             }
         }
+        // (A row that just became eligible is a neighbour of `v`: it waited
+        // for `v`, so it is queued here.)
         for &u in &neighbors {
             if queued[u] {
                 queue.insert(key(u, &adj));
-            }
-        }
-        for &r in &rows_of[v] {
-            if queued[r] && !done[r] {
-                queue.insert(key(r, &adj));
             }
         }
         adj[v].clear();
@@ -271,8 +296,8 @@ impl Ldl {
     /// `drop_below[i]` > 0 marks original index `i` droppable: a pivot of
     /// magnitude below it is replaced by a huge negative one, which removes
     /// that equation (multiplier 0) instead of dividing by it — a
-    /// redundant row met at a pivot ≈ −δ would otherwise amplify rounding
-    /// by 1/δ into every later pivot. The dropped indices are returned.
+    /// redundant row met at a rounding-size pivot would otherwise amplify
+    /// the rounding into every later pivot. The dropped indices are returned.
     fn factor(a: &Csc, perm: Vec<usize>, drop_below: &[f64]) -> Option<(Self, Vec<usize>)> {
         let n = a.n;
         let mut pinv = vec![0; n];
@@ -400,18 +425,11 @@ pub(crate) struct SaddleFactor {
     ldl: Ldl,
     /// The unregularized (symmetrized) matrix, for refinement.
     k: Csc,
-    /// Constraint rows (`0..m`) met by a pivot of size ≈ δ: redundant.
+    /// Constraint rows (`0..m`) met by a rounding-size pivot: redundant.
     redundant: Vec<usize>,
 }
 
 impl SaddleFactor {
-    /// [`SaddleFactor::new`] from dense `A` and `J` rows.
-    #[cfg(test)]
-    pub(crate) fn from_dense(a: &[Vec<f64>], j: &[Vec<f64>]) -> Option<Self> {
-        let n = a.len();
-        Self::new(n, &triplets_from_dense(a), &SparseRows::from_dense(j, n))
-    }
-
     /// Factor from the entries of `A` (`n × n`, symmetrized) and the rows
     /// of `J` (`m × n`). `None` when the matrix is not quasi-definite in
     /// this ordering (a non-positive body pivot, a zero pivot): use the
@@ -435,7 +453,7 @@ impl SaddleFactor {
                 entries.push((c, n + k, v));
             }
         }
-        let k = Csc::from_entries(n + m, entries.clone());
+        let k = Csc::from_entries(n + m, entries);
         // Regularization scales: the body diagonal, and per constraint row
         // the diagonal estimate of J·A⁻¹·Jᵀ.
         let a_max = diag.iter().fold(0.0_f64, |s, v| s.max(v.abs()));
@@ -451,8 +469,8 @@ impl SaddleFactor {
                     .sum::<f64>()
             })
             .collect();
-        entries.extend((0..n).map(|r| (r, r, DELTA_A * a_max)));
-        let k_reg = Csc::from_entries(n + m, entries);
+        let mut k_reg = k.clone();
+        k_reg.shift_diagonal(n, DELTA_A * a_max);
         let drop_below: Vec<f64> = (0..n + m)
             .map(|i| {
                 if i < n {
@@ -556,7 +574,7 @@ mod tests {
         ];
         let top = [1.0, -2.0, 0.5, 3.0];
         let bottom = [0.1, 0.2, 0.2];
-        let f = SaddleFactor::from_dense(&a, &j).expect("quasi-definite");
+        let f = SaddleFactor::new(4, &triplets_from_dense(&a), &SparseRows::from_dense(&j, 4)).expect("quasi-definite");
         assert_eq!(f.redundant(), &[2]);
         let (x, mu) = f.solve(&top, &bottom).expect("consistent");
         let mut rows = Vec::new();

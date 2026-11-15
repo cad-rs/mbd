@@ -1,4 +1,6 @@
-//! Dense rank-revealing linear algebra for the kinematic levels.
+//! Dense rank-revealing linear algebra: the diagnosing fallback behind the
+//! sparse saddle solver ([`crate::sparse`]), and the redundancy, conflict
+//! and null-space analyses.
 //!
 //! The constraint Jacobian `J` (equations × tangent coordinates) of a real
 //! CAD assembly is routinely rank-deficient in its rows: redundant
@@ -14,11 +16,11 @@
 
 /// Rank threshold on the remaining column norm (equilibrated columns start
 /// at norm 1).
-pub(crate) const RANK_TOL: f64 = 1.0e-9;
+const RANK_TOL: f64 = 1.0e-9;
 
 /// A dependent equation is consistent when its scaled residual is within
 /// this fraction of the scaled right side's magnitude (floor 1).
-pub(crate) const CONSIST_TOL: f64 = 1.0e-8;
+const CONSIST_TOL: f64 = 1.0e-8;
 
 /// A rank-revealing factorization of the rows of `J`.
 pub(crate) struct RowFactor {
@@ -106,6 +108,13 @@ impl RowFactor {
         &self.perm[self.rank..]
     }
 
+    /// The dependent equations, ascending.
+    pub fn dependent_sorted(&self) -> Vec<usize> {
+        let mut d = self.dependent().to_vec();
+        d.sort_unstable();
+        d
+    }
+
     /// Solve `J x = b` on the independent equations (minimum norm) and
     /// return `x` with the dependent equations the solution violates
     /// (conflicts), ascending.
@@ -151,6 +160,16 @@ impl RowFactor {
     }
 }
 
+
+/// The max norm.
+pub(crate) fn inf_norm(x: &[f64]) -> f64 {
+    x.iter().fold(0.0, |m, v| m.max(v.abs()))
+}
+
+/// The transpose of `rows` (each of length `n`).
+pub(crate) fn transpose(rows: &[Vec<f64>], n: usize) -> Vec<Vec<f64>> {
+    (0..n).map(|c| rows.iter().map(|r| r[c]).collect()).collect()
+}
 #[cfg(test)]
 mod tests {
     use super::*;

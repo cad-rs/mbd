@@ -12,9 +12,9 @@
 //!
 //! **Redundancy.** With redundant equations the multipliers are not unique:
 //! any `λ + n` with `Jᵀn = 0` satisfies the equations of motion. The
-//! reported reactions follow the multipliers' split (redundant equations
-//! removed on the sparse path, minimum-norm on the dense one), and each
-//! reaction lists
+//! reported reactions follow the multipliers' split (forward dynamics drops
+//! redundant equations on its sparse path, multiplier 0; its dense path and
+//! static equilibrium give the minimum-norm split), and each reaction lists
 //! the wrench directions along which that split is arbitrary (the image of
 //! the null space of `Jᵀ` on that joint). A planar loop of 3D revolutes,
 //! for example, determines every in-plane load but not how the out-of-plane
@@ -23,12 +23,11 @@
 
 use glam::DVec3;
 
+use crate::body::MarkerId;
 use crate::dynamics::{DynamicFrame, StaticEquilibrium};
 use crate::error::{codes, MbdError};
-use crate::kinematics::{
-    check_state, read_pose, EquationOwner, EquationRef, KinematicState, Problem,
-};
-use crate::linalg::RowFactor;
+use crate::kinematics::{check_state, EquationOwner, EquationRef, KinematicState, Problem};
+use crate::linalg::{transpose, RowFactor};
 use crate::system::System;
 
 /// Relative size below which an indeterminate wrench direction is noise.
@@ -65,8 +64,7 @@ impl Reaction {
 
     /// The I-side wrench as `[Fx, Fy, Fz, Tx, Ty, Tz]`.
     pub fn wrench_on_i(&self) -> [f64; 6] {
-        let (f, t) = (self.force_on_i, self.torque_on_i);
-        [f.x, f.y, f.z, t.x, t.y, t.z]
+        wrench_array(self.force_on_i, self.torque_on_i)
     }
 
     /// `w` with its components along the indeterminate directions removed
@@ -74,55 +72,55 @@ impl Reaction {
     pub fn determinate_part(&self, w: [f64; 6]) -> [f64; 6] {
         let mut out = w;
         for e in &self.indeterminate {
-            let d: f64 = out.iter().zip(e).map(|(a, b)| a * b).sum();
-            for (o, b) in out.iter_mut().zip(e) {
-                *o -= d * b;
-            }
+            remove_along(&mut out, e);
         }
         out
     }
 }
 
-/// The two marker ids of a joint or driver.
-fn markers(
-    sys: &System,
+/// `[Fx, Fy, Fz, Tx, Ty, Tz]`.
+fn wrench_array(f: DVec3, t: DVec3) -> [f64; 6] {
+    [f.x, f.y, f.z, t.x, t.y, t.z]
+}
+
+/// Remove from `w` its component along the unit vector `e`.
+fn remove_along(w: &mut [f64; 6], e: &[f64; 6]) {
+    let d: f64 = w.iter().zip(e).map(|(a, b)| a * b).sum();
+    for (wi, ei) in w.iter_mut().zip(e) {
+        *wi -= d * ei;
+    }
+}
+
+/// A joint or driver with its constraint rows and markers.
+struct Owner {
     owner: EquationOwner,
-) -> Option<(crate::body::MarkerId, crate::body::MarkerId)> {
-    let joint = match owner {
-        EquationOwner::Joint(id) => id,
-        EquationOwner::Driver(i) => sys.drivers.get(i)?.joint,
-        EquationOwner::Coupler(_) => return None,
-    };
-    let j = sys.joints.get(&joint)?;
-    Some((j.marker1, j.marker2))
+    rows: Vec<usize>,
+    i: MarkerId,
+    j: MarkerId,
 }
 
 /// The wrench on I (force, torque about marker I's origin) that the rows
-/// `rows` carry for multipliers `mu`.
+/// of `owner` carry for multipliers `mu`.
 fn wrench(
     problem: &Problem,
-    params: &[f64],
+    state: &KinematicState,
     j: &[Vec<f64>],
-    owner: EquationOwner,
-    rows: &[usize],
+    owner: &Owner,
     mu: &[f64],
 ) -> (DVec3, DVec3) {
     let sys = problem.sys;
-    let Some((mi, mj)) = markers(sys, owner) else {
-        return (DVec3::ZERO, DVec3::ZERO);
-    };
-    let point = |m: crate::body::MarkerId| {
+    let side = |m: MarkerId| {
         let marker = &sys.markers[&m];
-        let slot = problem.slot_of[&marker.body];
-        let (t, r) = read_pose(params, slot);
-        (slot, t, t + r * marker.translation)
+        let origin = state.body_pose(marker.body).expect("checked state").0;
+        (problem.slot_of[&marker.body], origin)
     };
-    let (slot_i, origin_i, p_i) = point(mi);
-    let (slot_j, origin_j, _) = point(mj);
+    let (slot_i, origin_i) = side(owner.i);
+    let (slot_j, origin_j) = side(owner.j);
+    let p_i = marker_point(sys, state, owner.i);
     let load = |slot: usize| -> Option<(DVec3, DVec3)> {
         let base = problem.col_of[slot]?;
         let (mut f, mut t) = (DVec3::ZERO, DVec3::ZERO);
-        for &k in rows {
+        for &k in &owner.rows {
             let row = &j[k];
             f -= mu[k] * DVec3::new(row[base], row[base + 1], row[base + 2]);
             t -= mu[k] * DVec3::new(row[base + 3], row[base + 4], row[base + 5]);
@@ -140,6 +138,14 @@ fn wrench(
     }
 }
 
+/// A marker's world origin.
+fn marker_point(sys: &System, state: &KinematicState, m: MarkerId) -> DVec3 {
+    let marker = &sys.markers[&m];
+    state
+        .world_point(marker.body, marker.translation)
+        .expect("checked state")
+}
+
 /// Orthonormal basis of `vectors` (Gram–Schmidt, dropping components below
 /// `tol`).
 fn orthonormal(vectors: &[[f64; 6]], tol: f64) -> Vec<[f64; 6]> {
@@ -148,10 +154,7 @@ fn orthonormal(vectors: &[[f64; 6]], tol: f64) -> Vec<[f64; 6]> {
         let mut w = *v;
         for _ in 0..2 {
             for e in &basis {
-                let d: f64 = w.iter().zip(e).map(|(a, b)| a * b).sum();
-                for (wi, ei) in w.iter_mut().zip(e) {
-                    *wi -= d * ei;
-                }
+                remove_along(&mut w, e);
             }
         }
         let norm = w.iter().map(|a| a * a).sum::<f64>().sqrt();
@@ -189,8 +192,7 @@ pub fn reactions(
             "pass the multipliers solved for this same system and instant",
         ));
     }
-    let params = &state.params;
-    let j = problem.jacobian(params);
+    let j = problem.jacobian(&state.params);
     let lambda: Vec<f64> = multipliers.iter().map(|(_, l)| *l).collect();
     let n = problem.n_cols;
     let m = problem.rows.len();
@@ -202,7 +204,7 @@ pub fn reactions(
     let null: Vec<Vec<f64>> = if dependent.is_empty() {
         Vec::new()
     } else {
-        let jt: Vec<Vec<f64>> = (0..n).map(|c| j.iter().map(|r| r[c]).collect()).collect();
+        let jt = transpose(&j, n);
         let factor = RowFactor::new(&jt, m);
         dependent
             .iter()
@@ -215,26 +217,36 @@ pub fn reactions(
             .collect()
     };
 
-    // Owners with their rows.
-    let mut owners: Vec<(EquationOwner, Vec<usize>)> = Vec::new();
+    // Joints and drivers with their rows (couplers act between joint
+    // coordinates, not between two markers: no reaction).
+    let mut owners: Vec<Owner> = Vec::new();
     for (k, row) in problem.rows.iter().enumerate() {
-        if matches!(row.owner, EquationOwner::Coupler(_)) {
+        if let Some(last) = owners.last_mut().filter(|o| o.owner == row.owner) {
+            last.rows.push(k);
             continue;
         }
-        match owners.last_mut() {
-            Some((o, rows)) if *o == row.owner => rows.push(k),
-            _ => owners.push((row.owner, vec![k])),
-        }
+        let joint = match row.owner {
+            EquationOwner::Joint(id) => id,
+            EquationOwner::Driver(i) => sys.drivers[i].joint,
+            EquationOwner::Coupler(_) => continue,
+        };
+        let joint = &sys.joints[&joint];
+        owners.push(Owner {
+            owner: row.owner,
+            rows: vec![k],
+            i: joint.marker1,
+            j: joint.marker2,
+        });
     }
 
     // Indeterminate wrench images, scaled against the largest one.
     let images: Vec<Vec<[f64; 6]>> = owners
         .iter()
-        .map(|(owner, rows)| {
+        .map(|owner| {
             null.iter()
                 .map(|nv| {
-                    let (f, t) = wrench(&problem, params, &j, *owner, rows, nv);
-                    [f.x, f.y, f.z, t.x, t.y, t.z]
+                    let (f, t) = wrench(&problem, state, &j, owner, nv);
+                    wrench_array(f, t)
                 })
                 .collect()
         })
@@ -246,23 +258,18 @@ pub fn reactions(
         .fold(0.0_f64, |a, v| a.max(v.abs()));
 
     let mut out = Vec::with_capacity(owners.len());
-    for ((owner, rows), image) in owners.iter().zip(&images) {
-        let (force_on_i, torque_on_i) = wrench(&problem, params, &j, *owner, rows, &lambda);
-        let (mi, mj) = markers(sys, *owner).expect("joint or driver");
-        let at = |m: crate::body::MarkerId| {
-            let marker = &sys.markers[&m];
-            let (t, r) = read_pose(params, problem.slot_of[&marker.body]);
-            t + r * marker.translation
-        };
-        let (p_i, p_j) = (at(mi), at(mj));
+    for (owner, image) in owners.iter().zip(&images) {
+        let (force_on_i, torque_on_i) = wrench(&problem, state, &j, owner, &lambda);
+        let p_i = marker_point(sys, state, owner.i);
+        let p_j = marker_point(sys, state, owner.j);
         out.push(Reaction {
-            owner: *owner,
+            owner: owner.owner,
             force_on_i,
             torque_on_i,
             force_on_j: -force_on_i,
             torque_on_j: -torque_on_i - (p_i - p_j).cross(force_on_i),
-            effort: match owner {
-                EquationOwner::Driver(_) => Some(-lambda[rows[0]]),
+            effort: match owner.owner {
+                EquationOwner::Driver(_) => Some(-lambda[owner.rows[0]]),
                 _ => None,
             },
             indeterminate: orthonormal(image, INDETERMINATE_TOL * biggest.max(f64::MIN_POSITIVE)),

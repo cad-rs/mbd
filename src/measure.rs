@@ -14,7 +14,7 @@ use glam::{DQuat, DVec3};
 use crate::body::{BodyId, MarkerId};
 use crate::driver::DriverSlot;
 use crate::joint::JointId;
-use crate::kinematics::{coordinate_motion, KinematicFrame, Twist};
+use crate::kinematics::{check_state, coordinate_jet, KinematicFrame, Twist};
 use crate::system::System;
 
 /// A point's world position and its first two time derivatives.
@@ -79,18 +79,16 @@ impl KinematicFrame {
         let m = sys.markers.get(&marker)?;
         let p = self.point(m.body, m.translation)?;
         let (_, r) = self.state.body_pose(m.body)?;
-        let v = self.velocity[&m.body];
-        let a = self.acceleration[&m.body];
         Some(MarkerMotion {
             position: p.position,
             rotation: r * m.rotation,
             velocity: Twist {
                 linear: p.velocity,
-                angular: v.angular,
+                angular: self.velocity[&m.body].angular,
             },
             acceleration: Twist {
                 linear: p.acceleration,
-                angular: a.angular,
+                angular: self.acceleration[&m.body].angular,
             },
         })
     }
@@ -124,6 +122,23 @@ impl KinematicFrame {
         if j.suppressed || !j.kind.drives(slot) {
             return None;
         }
-        coordinate_motion(sys, self, joint, slot)
+        check_state(sys, &self.state).ok()?;
+        let state = &self.state;
+        // The jet along the velocities gives the rate and the
+        // velocity-quadratic part, the jet along the accelerations the
+        // linear part `J·q̈`.
+        let vel: Vec<Twist> = state.order.iter().map(|id| self.velocity[id]).collect();
+        let acc: Vec<Twist> = state.order.iter().map(|id| self.acceleration[id]).collect();
+        let jv = coordinate_jet(sys, &state.slot_of, &state.params, &vel, joint, slot);
+        let ja = coordinate_jet(sys, &state.slot_of, &state.params, &acc, joint, slot);
+        let value = match slot {
+            DriverSlot::Rotation => state.joint_angle(joint).unwrap_or(jv.v),
+            DriverSlot::Translation => jv.v,
+        };
+        Some(JointMotion {
+            value,
+            velocity: jv.d,
+            acceleration: jv.dd + ja.d,
+        })
     }
 }

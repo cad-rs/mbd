@@ -57,22 +57,22 @@
 //! acceleration level. The integrator's own state is never modified by the
 //! projection.
 
-use crate::dynamics::{
-    applied_forces, dynamic_ic, flatten, inertias, output_frame, retract, slot_twists, DynamicFrame,
-};
-use crate::error::{codes, MbdError};
 use std::collections::BTreeSet;
 
+use crate::dynamics::{
+    applied_forces, dynamic_ic, flatten, inertias, output_frame, slot_twists, DynamicFrame,
+};
+use crate::error::{codes, MbdError};
 use crate::kinematics::{joint_slots, KinematicState, Problem, BODY_TWIST};
-use crate::linalg::RowFactor;
-use crate::sparse::{SaddleFactor, SparseRows, Triplets};
+use crate::linalg::{inf_norm, RowFactor};
+use crate::sparse::{dense_saddle, SaddleFactor, SparseRows, Triplets};
 use crate::system::System;
 
 /// The Adams default HHT α.
 pub const DEFAULT_ALPHA: f64 = -0.3;
 
-/// Position-constraint tolerance of a converged step (m / rad), and its
-/// fraction of the error tolerance under error control.
+/// Under error control the position-constraint target is also at most this
+/// fraction of the error tolerance.
 const CONSTRAINT_TOL_FRACTION: f64 = 1.0e-2;
 
 /// Under error control the velocity correction must fall below this
@@ -192,6 +192,21 @@ struct Point {
     lambda: Vec<f64>,
 }
 
+impl Point {
+    /// The start point from the dynamic initial condition.
+    fn initial(problem: &Problem, frame: &DynamicFrame) -> Self {
+        let a = flatten(problem, &slot_twists(problem.sys, &frame.acceleration));
+        Self {
+            time: frame.time,
+            state: frame.state.clone(),
+            v: flatten(problem, &slot_twists(problem.sys, &frame.velocity)),
+            aux: a.clone(),
+            acc: a,
+            lambda: frame.multipliers.iter().map(|(_, l)| *l).collect(),
+        }
+    }
+}
+
 /// One residual evaluation of a step.
 struct Eval {
     /// Dynamic rows, then the scaled constraint rows.
@@ -202,10 +217,6 @@ struct Eval {
     j: SparseRows,
 }
 
-fn inf_norm(x: &[f64]) -> f64 {
-    x.iter().fold(0.0, |m, v| m.max(v.abs()))
-}
-
 /// Column groups for the forward-difference iteration matrix: a
 /// distance-2 colouring of the body coupling graph (two bodies are coupled
 /// when one joint, coupler, driver or force element involves both). The
@@ -214,7 +225,7 @@ fn inf_norm(x: &[f64]) -> f64 {
 /// residual evaluation and every row still sees one perturbed column —
 /// the same differences as perturbing column by column (Curtis–Powell–Reid).
 /// A chain needs three colours, whatever its length.
-pub(crate) struct Coloring {
+struct Coloring {
     /// Free body slots per colour.
     groups: Vec<Vec<usize>>,
     /// Closed neighbourhood of every slot (itself included).
@@ -222,7 +233,7 @@ pub(crate) struct Coloring {
 }
 
 impl Coloring {
-    pub(crate) fn new(problem: &Problem) -> Self {
+    fn new(problem: &Problem) -> Self {
         let sys = problem.sys;
         let n = problem.n_bodies();
         let mut adj: Vec<BTreeSet<usize>> = (0..n).map(|s| BTreeSet::from([s])).collect();
@@ -299,7 +310,7 @@ impl Step<'_, '_> {
         let delta: Vec<f64> = (0..a.len())
             .map(|i| h * p.v[i] + h * h * ((0.5 - self.beta) * p.aux[i] + self.beta * a[i]))
             .collect();
-        let params = retract(self.problem, &p.state.params, &delta);
+        let params = self.problem.retract(&p.state.params, &delta);
         let v = (0..a.len())
             .map(|i| p.v[i] + h * ((1.0 - self.gamma) * p.aux[i] + self.gamma * a[i]))
             .collect();
@@ -313,7 +324,7 @@ impl Step<'_, '_> {
         let vel = problem.twists(&v);
         let acc = problem.twists(x);
         let mut net = applied_forces(problem, &params, &vel)?;
-        for ((slot, i), n) in inertias(problem, &params)
+        for ((slot, i), n) in inertias(problem.sys, &params)
             .iter()
             .enumerate()
             .zip(net.iter_mut())
@@ -346,23 +357,33 @@ impl Step<'_, '_> {
         })
     }
 
+    /// Re-evaluate at `(x, λ)` and rebuild the iteration matrix there;
+    /// returns the evaluation.
+    fn rebuild(
+        &self,
+        x: &[f64],
+        lambda: &[f64],
+        factor: &mut Option<Factor>,
+        stats: &mut IntegrationStats,
+    ) -> Result<Eval, MbdError> {
+        let base = self.eval(x, lambda)?;
+        *factor = Some(self.matrix(x, lambda, &base)?);
+        stats.jacobians += 1;
+        Ok(base)
+    }
+
     /// The iteration matrix at `(x, λ)`: `[∂r/∂q̈ Jᵀ; J 0]`. `∂r/∂q̈` by
     /// forward differences, one residual evaluation per colour group and
     /// direction ([`Coloring`]).
     fn matrix(&self, x: &[f64], lambda: &[f64], base: &Eval) -> Result<Factor, MbdError> {
         let n = x.len();
         let a = self.fd_triplets(x, lambda, base)?;
-        // Sparse quasi-definite LDLᵀ of the symmetric part (a modified-Newton
-        // matrix may be approximate); the dense QR when it declines.
-        let sparse = SaddleFactor::new(n, &a, &base.j);
-        if let Some(f) = sparse {
+        // Sparse LDLᵀ of the symmetric part (a modified-Newton matrix may be
+        // approximate); the dense QR when it declines.
+        if let Some(f) = SaddleFactor::new(n, &a, &base.j) {
             return Ok(Factor::Sparse(f));
         }
-        let mut dense = vec![vec![0.0; n]; n];
-        for (r, c, v) in a {
-            dense[r][c] += v;
-        }
-        let rows = self.with_constraints(dense, base);
+        let rows = dense_saddle(n, &a, &base.j);
         Ok(Factor::Dense(RowFactor::new(&rows, rows.len())))
     }
 
@@ -396,64 +417,13 @@ impl Step<'_, '_> {
         }
         Ok(entries)
     }
-
-    /// The column-by-column forward-difference matrix — the reference the
-    /// coloured one must reproduce.
-    #[cfg(test)]
-    fn fd_rows_full(
-        &self,
-        x: &[f64],
-        lambda: &[f64],
-        base: &Eval,
-    ) -> Result<Vec<Vec<f64>>, MbdError> {
-        let n = x.len();
-        let mut rows = vec![vec![0.0; n]; n];
-        let mut trial = x.to_vec();
-        for c in 0..n {
-            let eps = FD_STEP * (1.0 + x[c].abs());
-            trial[c] = x[c] + eps;
-            let e = self.eval(&trial, lambda)?;
-            trial[c] = x[c];
-            for (row, (ri, bi)) in rows.iter_mut().zip(e.r.iter().zip(&base.r)).take(n) {
-                row[c] = (ri - bi) / eps;
-            }
-        }
-        Ok(rows)
-    }
-
-    /// The full `[A Jᵀ; J 0]` rows from the dense `A` (the dense fallback).
-    fn with_constraints(&self, a: Vec<Vec<f64>>, base: &Eval) -> Vec<Vec<f64>> {
-        let n = self.problem.n_cols;
-        let m = base.j.len();
-        let mut rows: Vec<Vec<f64>> = a
-            .into_iter()
-            .map(|mut r| {
-                r.resize(n + m, 0.0);
-                r
-            })
-            .collect();
-        rows.resize(n + m, vec![0.0; n + m]);
-        let j = base.j.to_dense();
-        for (k, jr) in j.iter().enumerate() {
-            for (i, row) in rows.iter_mut().enumerate().take(n) {
-                row[n + k] = jr[i];
-            }
-            rows[n + k][..n].copy_from_slice(jr);
-        }
-        debug_assert_eq!(rows.len(), n + m);
-        rows
-    }
 }
 
-/// The iteration matrix reused across steps. With the `1/(β·h²)` scaling
-/// its constraint blocks do not depend on `h`, only the (small) stiffness
-/// and damping terms do, so it stays a good modified-Newton matrix across
-/// step-size changes; slow convergence or a failed step rebuilds it.
-struct Cache {
-    factor: Factor,
-}
-
-/// A factored iteration matrix.
+/// A factored iteration matrix, reused across steps. With the
+/// `1/((1+α)·β·h²)` constraint scaling its constraint blocks do not depend
+/// on `h`, only the (small) stiffness and damping terms do, so it stays a
+/// good modified-Newton matrix across step-size changes; slow convergence
+/// or a failed step rebuilds it.
 enum Factor {
     Sparse(SaddleFactor),
     Dense(RowFactor),
@@ -486,14 +456,8 @@ struct NewtonTargets {
 
 impl NewtonTargets {
     fn new(settings: &HhtSettings, from: &Point, h: f64) -> Self {
-        let position_scale = from
-            .state
-            .params
-            .iter()
-            .fold(0.0_f64, |s, v| s.max(v.abs()));
-        let eps = f64::EPSILON;
-        let velocity_floor = 64.0 * eps * (1.0 + position_scale) / h;
-        let constraint_floor = 64.0 * eps * (1.0 + position_scale);
+        let position_scale = inf_norm(&from.state.params);
+        let floor = 64.0 * f64::EPSILON * (1.0 + position_scale);
         let (cap, constraint) = match settings.error_tol {
             Some(tol) => (
                 NEWTON_TOL_FRACTION * tol / h,
@@ -504,8 +468,8 @@ impl NewtonTargets {
         Self {
             relative: settings.newton_tol,
             cap,
-            velocity_floor,
-            constraint: constraint.max(constraint_floor),
+            velocity_floor: floor / h,
+            constraint: constraint.max(floor),
         }
     }
 
@@ -516,6 +480,11 @@ impl NewtonTargets {
     }
 }
 
+/// The Newmark `(β, γ)` of HHT-α.
+fn newmark(alpha: f64) -> (f64, f64) {
+    ((1.0 - alpha) * (1.0 - alpha) / 4.0, 0.5 - alpha)
+}
+
 /// Attempt one step; `None` when Newton does not converge.
 fn take_step(
     problem: &Problem,
@@ -523,39 +492,41 @@ fn take_step(
     from: &Point,
     h: f64,
     settings: &HhtSettings,
-    cache: &mut Option<Cache>,
+    factor: &mut Option<Factor>,
     stats: &mut IntegrationStats,
 ) -> Result<Option<Point>, MbdError> {
     let alpha = settings.alpha;
+    let (beta, gamma) = newmark(alpha);
     let step = Step {
         problem,
         from,
         coloring,
         h,
         alpha,
-        beta: (1.0 - alpha) * (1.0 - alpha) / 4.0,
-        gamma: 0.5 - alpha,
+        beta,
+        gamma,
     };
     let n = from.acc.len();
     let mut a = from.acc.clone();
     let mut lambda = from.lambda.clone();
-    let mut fresh = false;
-    if cache.is_none() {
-        let base = step.eval(&a, &lambda)?;
-        *cache = Some(Cache {
-            factor: step.matrix(&a, &lambda, &base)?,
-        });
-        stats.jacobians += 1;
-        fresh = true;
+    // A rebuilt matrix comes with the residual it was built at: the next
+    // iteration's residual.
+    let mut pending = None;
+    let fresh = factor.is_none();
+    if fresh {
+        pending = Some(step.rebuild(&a, &lambda, factor, stats)?);
     }
+    let mut rebuilt = fresh;
     let mut stale = 0;
     let tolerances = NewtonTargets::new(settings, from, h);
     let mut previous = f64::INFINITY;
     for _ in 0..settings.max_newton {
-        let ev = step.eval(&a, &lambda)?;
+        let ev = match pending.take() {
+            Some(ev) => ev,
+            None => step.eval(&a, &lambda)?,
+        };
         let rhs: Vec<f64> = ev.r.iter().map(|v| -v).collect();
-        let factor = &cache.as_ref().expect("built above").factor;
-        let dx = factor.solve(&rhs);
+        let dx = factor.as_ref().expect("built above").solve(&rhs);
         stats.newton_iterations += 1;
         if dx.iter().any(|v| !v.is_finite()) {
             return Ok(None);
@@ -566,7 +537,7 @@ fn take_step(
         for (li, d) in lambda.iter_mut().zip(&dx[n..]) {
             *li += d;
         }
-        let correction = step.gamma * (1.0 + alpha) * h * inf_norm(&dx[..n]);
+        let correction = gamma * (1.0 + alpha) * h * inf_norm(&dx[..n]);
         let target = tolerances.velocity(inf_norm(&ev.v));
         // Converged — or stalled at the rounding floor (index 3 carries
         // position rounding into the velocities as ~ε/h).
@@ -591,13 +562,9 @@ fn take_step(
             }));
         }
         stale += 1;
-        if !fresh && stale >= STALE_ITERATIONS {
-            let base = step.eval(&a, &lambda)?;
-            *cache = Some(Cache {
-                factor: step.matrix(&a, &lambda, &base)?,
-            });
-            stats.jacobians += 1;
-            fresh = true;
+        if !rebuilt && stale >= STALE_ITERATIONS {
+            pending = Some(step.rebuild(&a, &lambda, factor, stats)?);
+            rebuilt = true;
         }
     }
     Ok(None)
@@ -609,7 +576,6 @@ fn check_settings(settings: &HhtSettings) -> Result<(), MbdError> {
         && positive(settings.step)
         && positive(settings.min_step)
         && settings.max_step > 0.0
-        && !settings.max_step.is_nan()
         && settings.min_step <= settings.step
         && settings.step <= settings.max_step
         && settings.error_tol.is_none_or(positive)
@@ -626,21 +592,22 @@ fn check_settings(settings: &HhtSettings) -> Result<(), MbdError> {
     }
 }
 
-/// Error-test outcome of an accepted Newton solve.
-enum Verdict {
-    Accept,
-    Reject,
+/// The error test of a converged step.
+enum Control {
+    /// Accept; `Some` proposes the next controller step, `None` keeps it.
+    Accept(Option<f64>),
+    /// Reject; retry with (at most) this step.
+    Reject(f64),
 }
 
-/// The local error ratio of a converged step (estimate / tolerance) and
-/// the controller's verdict with the next step proposal.
-/// `None` as the proposal: keep the controller step as it is.
-fn control(settings: &HhtSettings, from: &Point, to: &Point, h: f64) -> (Verdict, Option<f64>) {
+/// The step controller: the local error ratio (estimate / tolerance) of a
+/// converged step and the verdict. Without error control every converged
+/// step is accepted at the nominal step.
+fn control(settings: &HhtSettings, from: &Point, to: &Point, h: f64) -> Control {
     let Some(tol) = settings.error_tol else {
-        return (Verdict::Accept, None);
+        return Control::Accept(None);
     };
-    let alpha = settings.alpha;
-    let beta = (1.0 - alpha) * (1.0 - alpha) / 4.0;
+    let (beta, _) = newmark(settings.alpha);
     let jump = from
         .acc
         .iter()
@@ -657,11 +624,11 @@ fn control(settings: &HhtSettings, from: &Point, to: &Point, h: f64) -> (Verdict
     // only changes when the change is worth it.
     let next = (h * ideal).clamp(settings.min_step, settings.max_step);
     if ratio > 1.0 {
-        (Verdict::Reject, Some(next))
+        Control::Reject(next)
     } else if ratio > SHRINK_ABOVE || ideal >= GROW_AT {
-        (Verdict::Accept, Some(next))
+        Control::Accept(Some(next))
     } else {
-        (Verdict::Accept, None)
+        Control::Accept(None)
     }
 }
 
@@ -697,24 +664,12 @@ pub fn simulate(
         ));
     }
     let first = dynamic_ic(sys, times[0])?;
-    let mut point = {
-        let problem = Problem::new(sys, times[0], &first.state.angles);
-        let v = flatten(&problem, &slot_twists(&problem, &first.velocity));
-        let a = flatten(&problem, &slot_twists(&problem, &first.acceleration));
-        let lambda: Vec<f64> = first.multipliers.iter().map(|(_, l)| *l).collect();
-        Point {
-            time: times[0],
-            state: first.state.clone(),
-            v,
-            aux: a.clone(),
-            acc: a,
-            lambda,
-        }
-    };
+    let problem = Problem::new(sys, times[0], &first.state.angles);
+    let coloring = Coloring::new(&problem);
+    let mut point = Point::initial(&problem, &first);
     let mut frames = vec![first];
     let mut stats = IntegrationStats::default();
-    let mut cache: Option<Cache> = None;
-    let coloring = Coloring::new(&Problem::new(sys, times[0], &point.state.angles));
+    let mut factor: Option<Factor> = None;
     // The controller's step (fixed step: the nominal one).
     let mut h_ctrl = settings.step;
     for &target in &times[1..] {
@@ -738,11 +693,11 @@ pub fn simulate(
                 let h_step = t1 - point.time;
                 let problem = Problem::new(sys, t1, &point.state.angles);
                 let Some(next) = take_step(
-                    &problem, &coloring, &point, h_step, settings, &mut cache, &mut stats,
+                    &problem, &coloring, &point, h_step, settings, &mut factor, &mut stats,
                 )?
                 else {
                     stats.rejected += 1;
-                    cache = None;
+                    factor = None;
                     retried = true;
                     h *= 0.5;
                     if settings.error_tol.is_some() {
@@ -757,24 +712,25 @@ pub fn simulate(
                     }
                     continue;
                 };
-                let (verdict, proposal) = control(settings, &point, &next, h_step);
-                match verdict {
-                    Verdict::Reject => {
+                match control(settings, &point, &next, h_step) {
+                    Control::Reject(proposal) => {
                         stats.rejected += 1;
                         retried = true;
-                        h = proposal.unwrap_or(h_step).min(0.9 * h_step);
+                        h = proposal.min(0.9 * h_step);
                         h_ctrl = h;
                         if h < settings.min_step {
                             return Err(too_small(point.time, h, "the local error test failed"));
                         }
                     }
-                    Verdict::Accept => {
+                    Control::Accept(proposal) => {
                         // (Spread steps are at least half the controller step, so
-                        // their proposals are representative; no growth right
-                        // after a rejection.)
+                        // their proposals are representative.) Under error
+                        // control no growth right after a rejection; a fixed
+                        // step returns to the nominal one.
                         if let Some(p) = proposal {
-                            h_ctrl = if retried { p.min(h_step) } else { p };
-                        } else if retried {
+                            h_ctrl = p;
+                        }
+                        if retried && settings.error_tol.is_some() {
                             h_ctrl = h_ctrl.min(h_step);
                         }
                         point = next;
@@ -892,17 +848,8 @@ mod tests {
         let first = dynamic_ic(&sys, 0.0).unwrap();
         let problem = Problem::new(&sys, 0.0, &first.state.angles);
         let coloring = Coloring::new(&problem);
-        let v = flatten(&problem, &slot_twists(&problem, &first.velocity));
-        let a = flatten(&problem, &slot_twists(&problem, &first.acceleration));
-        let lambda: Vec<f64> = first.multipliers.iter().map(|(_, l)| *l).collect();
-        let point = Point {
-            time: 0.0,
-            state: first.state.clone(),
-            v,
-            aux: a.clone(),
-            acc: a.clone(),
-            lambda: lambda.clone(),
-        };
+        let point = Point::initial(&problem, &first);
+        let (a, lambda) = (point.acc.clone(), point.lambda.clone());
         let next = Problem::new(&sys, 1e-3, &first.state.angles);
         let step = Step {
             problem: &next,
@@ -919,7 +866,18 @@ mod tests {
         for (r, c, v) in step.fd_triplets(&a, &lambda, &base).unwrap() {
             coloured[r][c] += v;
         }
-        let full = step.fd_rows_full(&a, &lambda, &base).unwrap();
+        // The column-by-column reference.
+        let mut full = vec![vec![0.0; n]; n];
+        let mut trial = a.clone();
+        for c in 0..n {
+            let eps = FD_STEP * (1.0 + a[c].abs());
+            trial[c] = a[c] + eps;
+            let e = step.eval(&trial, &lambda).unwrap();
+            trial[c] = a[c];
+            for (row, (ri, bi)) in full.iter_mut().zip(e.r.iter().zip(&base.r)) {
+                row[c] = (ri - bi) / eps;
+            }
+        }
         assert_eq!(coloured, full);
         assert!(
             coloring.groups.len() < 6,
