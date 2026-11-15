@@ -36,7 +36,8 @@ use rcad_gcs::numerics::{newton_solve, SolveResult as GcsSolveResult};
 use crate::body::{BodyId, MarkerId};
 use crate::error::{codes, MbdError};
 use crate::jet::{BodyMotion, FrameJet, Jet};
-use crate::joint::{joint_coordinate, joint_rows, DriverSlot, JointId};
+use crate::driver::DriverSlot;
+use crate::joint::{joint_coordinate, joint_rows, JointId};
 use crate::linalg::RowFactor;
 use crate::sparse::{SaddleFactor, SparseRows, Triplets};
 use crate::system::System;
@@ -1005,7 +1006,8 @@ mod tests {
     use super::*;
     use crate::body::Body;
     use crate::force::ForceElement;
-    use crate::joint::{Driver, DriverProfile, Joint, JointKind};
+    use crate::driver::{Driver, DriverProfile};
+    use crate::joint::{Joint, JointKind};
     use crate::{BodyId, ForceId, JointId, Marker, MarkerId};
     use glam::DMat3;
 

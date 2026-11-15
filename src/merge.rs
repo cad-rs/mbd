@@ -232,7 +232,8 @@ pub fn merge_fixed_groups(sys: &System) -> Result<MergedSystem, MbdError> {
     }
     let merged_joints: Vec<JointId> = fixed.iter().map(|j| j.id).collect();
     for (id, j) in &sys.joints {
-        if !merged_joints.contains(id) {
+        // Exactly the joints `fixed` collected are merged away.
+        if !(j.kind == JointKind::Fixed && !j.suppressed) {
             out.joints.insert(*id, j.clone());
         }
     }

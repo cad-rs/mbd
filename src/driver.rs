@@ -206,7 +206,7 @@ fn keyframes(points: &[(f64, f64)], t: f64) -> DriverSample {
             };
         }
     }
-    held(points.last().map(|k| k.1).unwrap_or(0.0))
+    held(points[points.len() - 1].1)
 }
 
 fn step5(t0: f64, v0: f64, t1: f64, v1: f64, t: f64) -> DriverSample {

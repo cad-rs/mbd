@@ -1,5 +1,5 @@
 //! Structured errors: `{code, detail, hint}` data, never a panic at the
-//! crate boundary (the tool-surface convention).
+//! crate boundary.
 
 use thiserror::Error;
 

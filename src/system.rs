@@ -1,7 +1,7 @@
 //! The system: every table the solver reads, keyed by stable ids in sorted
-//! order so equation numbering and serialized bytes are reproducible
-//! (OndselSolver's `createMbD` name-sort lesson).
+//! order so equation numbering and serialized bytes are reproducible.
 
+use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
 
 use glam::DVec3;
@@ -11,7 +11,8 @@ use crate::body::{Body, BodyId, Marker, MarkerId};
 use crate::coupler::{Coupler, CouplerId};
 use crate::error::{codes, MbdError};
 use crate::force::{ForceElement, ForceId};
-use crate::joint::{Driver, DriverSlot, Joint, JointId};
+use crate::driver::Driver;
+use crate::joint::{Joint, JointId};
 
 /// Standard gravity, SI (m/s²).
 pub const STANDARD_GRAVITY: f64 = 9.806_65;
@@ -57,30 +58,15 @@ impl System {
     }
 
     pub fn add_body(&mut self, body: Body) -> Result<BodyId, MbdError> {
-        let id = body.id;
-        if self.bodies.contains_key(&id) {
-            return Err(duplicate("body", id.0));
-        }
-        self.bodies.insert(id, body);
-        Ok(id)
+        insert_new(&mut self.bodies, body.id, body.id.0, "body", body)
     }
 
     pub fn add_marker(&mut self, marker: Marker) -> Result<MarkerId, MbdError> {
-        let id = marker.id;
-        if self.markers.contains_key(&id) {
-            return Err(duplicate("marker", id.0));
-        }
-        self.markers.insert(id, marker);
-        Ok(id)
+        insert_new(&mut self.markers, marker.id, marker.id.0, "marker", marker)
     }
 
     pub fn add_joint(&mut self, joint: Joint) -> Result<JointId, MbdError> {
-        let id = joint.id;
-        if self.joints.contains_key(&id) {
-            return Err(duplicate("joint", id.0));
-        }
-        self.joints.insert(id, joint);
-        Ok(id)
+        insert_new(&mut self.joints, joint.id, joint.id.0, "joint", joint)
     }
 
     pub fn add_driver(&mut self, driver: Driver) {
@@ -89,25 +75,18 @@ impl System {
 
     pub fn add_force(&mut self, force: ForceElement) -> Result<ForceId, MbdError> {
         let id = force.id();
-        if self.forces.contains_key(&id) {
-            return Err(duplicate("force", id.0));
-        }
-        self.forces.insert(id, force);
-        Ok(id)
+        insert_new(&mut self.forces, id, id.0, "force", force)
     }
 
     pub fn add_coupler(&mut self, coupler: Coupler) -> Result<CouplerId, MbdError> {
-        let id = coupler.id;
-        if self.couplers.contains_key(&id) {
-            return Err(duplicate("coupler", id.0));
-        }
-        self.couplers.insert(id, coupler);
-        Ok(id)
+        insert_new(&mut self.couplers, coupler.id, coupler.id.0, "coupler", coupler)
     }
 
-    /// Referential and physical integrity: every reference resolves, every
-    /// mass is positive and finite, every driver slot is a degree of freedom
-    /// of its joint kind. The solver entry points (M1+) run this first.
+    /// Referential and physical integrity: every reference resolves; every
+    /// free mass is positive and finite; force elements, driver profiles and
+    /// couplers carry usable data; every driver, coupler term and measured
+    /// coordinate addresses a degree of freedom of its joint kind; a joint
+    /// slot takes one driver. The solver entry points run this first.
     pub fn validate(&self) -> Result<(), MbdError> {
         for body in self.bodies.values() {
             let finite = body.mass_kg.is_finite()
@@ -197,7 +176,7 @@ impl System {
                     "rotation drives revolute/cylindrical/planar; translation drives prismatic/cylindrical",
                 ));
             }
-            if !driven.insert((driver.joint, driver.slot == DriverSlot::Rotation)) {
+            if !driven.insert((driver.joint, driver.slot)) {
                 return Err(MbdError::new(
                     codes::DUPLICATE_DRIVER,
                     format!(
@@ -252,10 +231,23 @@ impl System {
     }
 }
 
-fn duplicate(table: &str, id: u64) -> MbdError {
-    MbdError::new(
-        codes::DUPLICATE_ID,
-        format!("{table} id {id} is already in the system"),
-        "ids are stable keys; allocate a fresh one",
-    )
+/// Insert under a fresh id; a taken id is [`codes::DUPLICATE_ID`].
+fn insert_new<K: Ord + Copy, V>(
+    table: &mut BTreeMap<K, V>,
+    id: K,
+    raw: u64,
+    kind: &str,
+    value: V,
+) -> Result<K, MbdError> {
+    match table.entry(id) {
+        Entry::Occupied(_) => Err(MbdError::new(
+            codes::DUPLICATE_ID,
+            format!("{kind} id {raw} is already in the system"),
+            "ids are stable keys; allocate a fresh one",
+        )),
+        Entry::Vacant(slot) => {
+            slot.insert(value);
+            Ok(id)
+        }
+    }
 }

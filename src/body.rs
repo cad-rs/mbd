@@ -17,8 +17,8 @@ pub struct MarkerId(pub u64);
 /// it.
 ///
 /// `inertia_com` is the inertia tensor about the center of mass, expressed
-/// in the body's reference-frame axes (the kernel's `GProp` matrix of
-/// inertia, converted to SI by the caller).
+/// in the body's reference-frame axes (any mass-property tool's tensor,
+/// converted to SI by the caller).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Body {
     pub id: BodyId,

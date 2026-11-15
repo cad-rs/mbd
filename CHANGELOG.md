@@ -14,7 +14,7 @@
 
 ### Tier C — MuJoCo cross-check
 
-- `mjcf` module: `write_mjcf(sys, &MjcfOptions)` — tree mechanisms
+- `mjcf` module: `write_mjcf(sys)` (RK4 at 0.1 ms) — tree mechanisms
   (hinge / slide / ball / hinge+slide / nested welds, free bodies as
   freejoints with their initial velocity in a keyframe), revolute /
   spherical loop closures as `connect` equalities, gravity, spring-dampers

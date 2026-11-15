@@ -27,7 +27,7 @@ use crate::body::{BodyId, MarkerId};
 use crate::driver::DriverSlot;
 use crate::dynamics::{energy, forward_dynamics, momentum, static_equilibrium, Energy, Momentum};
 use crate::error::{codes, MbdError};
-use crate::integrate::{simulate, HhtSettings, IntegrationStats, DEFAULT_ALPHA, DEFAULT_ERROR_TOL};
+use crate::integrate::{simulate, HhtSettings, IntegrationStats};
 use crate::joint::JointId;
 use crate::kinematics::{kinematic_sweep, EquationOwner, EquationRef, KinematicFrame, Twist};
 use crate::measure::{JointMotion, MarkerMotion, PointMotion, RelativeMotion};
@@ -92,9 +92,9 @@ impl Default for Integrator {
     fn default() -> Self {
         let d = HhtSettings::default();
         Self {
-            alpha: DEFAULT_ALPHA,
+            alpha: d.alpha,
             step: d.step,
-            error_tol: Some(DEFAULT_ERROR_TOL),
+            error_tol: d.error_tol,
             min_step: d.min_step,
             max_step: None,
             max_newton: d.max_newton,
@@ -363,30 +363,30 @@ pub fn run_study(sys: &System, study: &Study) -> Result<StudyResult, MbdError> {
     }
     let times = study.output.times()?;
     let mut stats = None;
-    // (kinematic frame, reactions) per output time.
-    let mut solved: Vec<(KinematicFrame, Vec<Reaction>)> = Vec::with_capacity(times.len());
+    let mut frames = Vec::with_capacity(times.len());
+    let mut redundant = None;
+    let mut push = |frame: KinematicFrame, reactions: Vec<Reaction>| -> Result<(), MbdError> {
+        redundant.get_or_insert_with(|| frame.redundant.clone());
+        frames.push(result_frame(sys, study, &frame, &reactions)?);
+        Ok(())
+    };
     match &study.analysis {
         Analysis::Kinematic => {
             for frame in kinematic_sweep(sys, &times)? {
                 let reactions = if study.reactions {
-                    forward_dynamics(sys, frame.time, &frame.state, &frame.velocity)?
-                        .reactions(sys)?
+                    forward_dynamics(sys, frame.time, &frame.state, &frame.velocity)?.reactions(sys)?
                 } else {
                     Vec::new()
                 };
-                solved.push((frame, reactions));
+                push(frame, reactions)?;
             }
         }
         Analysis::Dynamic { integrator } => {
             let sim = simulate(sys, &times, &HhtSettings::from(integrator))?;
             stats = Some(sim.stats);
             for frame in sim.frames {
-                let reactions = if study.reactions {
-                    frame.reactions(sys)?
-                } else {
-                    Vec::new()
-                };
-                solved.push((
+                let reactions = if study.reactions { frame.reactions(sys)? } else { Vec::new() };
+                push(
                     KinematicFrame {
                         time: frame.time,
                         state: frame.state,
@@ -395,18 +395,14 @@ pub fn run_study(sys: &System, study: &Study) -> Result<StudyResult, MbdError> {
                         redundant: frame.redundant,
                     },
                     reactions,
-                ));
+                )?;
             }
         }
         Analysis::Static => {
             let mut seed = None;
             for &time in &times {
                 let eq = static_equilibrium(sys, time, seed.as_ref())?;
-                let reactions = if study.reactions {
-                    eq.reactions(sys)?
-                } else {
-                    Vec::new()
-                };
+                let reactions = if study.reactions { eq.reactions(sys)? } else { Vec::new() };
                 let rest: BTreeMap<BodyId, Twist> = eq
                     .state
                     .order()
@@ -414,7 +410,7 @@ pub fn run_study(sys: &System, study: &Study) -> Result<StudyResult, MbdError> {
                     .map(|id| (*id, Twist::default()))
                     .collect();
                 seed = Some(eq.state.clone());
-                solved.push((
+                push(
                     KinematicFrame {
                         time,
                         state: eq.state,
@@ -423,52 +419,54 @@ pub fn run_study(sys: &System, study: &Study) -> Result<StudyResult, MbdError> {
                         redundant: eq.redundant,
                     },
                     reactions,
-                ));
+                )?;
             }
         }
-    }
-    let redundant = solved
-        .first()
-        .map(|(f, _)| f.redundant.clone())
-        .unwrap_or_default();
-    let mut frames = Vec::with_capacity(solved.len());
-    for (frame, reactions) in &solved {
-        let bodies = frame
-            .state
-            .order()
-            .iter()
-            .map(|id| {
-                let (position, rotation) = frame.state.body_pose(*id).expect("own body");
-                (
-                    *id,
-                    BodyResult {
-                        position,
-                        rotation,
-                        velocity: frame.velocity[id],
-                        acceleration: frame.acceleration[id],
-                    },
-                )
-            })
-            .collect();
-        frames.push(ResultFrame {
-            time: frame.time,
-            bodies,
-            reactions: reactions.iter().map(ReactionResult::from).collect(),
-            measures: study
-                .measures
-                .iter()
-                .filter_map(|m| m.evaluate(sys, frame))
-                .collect(),
-            energy: energy(sys, &frame.state, &frame.velocity)?,
-            momentum: momentum(sys, &frame.state, &frame.velocity)?,
-        });
     }
     Ok(StudyResult {
         study: study.name.clone(),
         analysis: study.analysis.clone(),
         frames,
-        redundant,
+        redundant: redundant.unwrap_or_default(),
         stats,
+    })
+}
+
+/// One output time's results.
+fn result_frame(
+    sys: &System,
+    study: &Study,
+    frame: &KinematicFrame,
+    reactions: &[Reaction],
+) -> Result<ResultFrame, MbdError> {
+    let bodies = frame
+        .state
+        .order()
+        .iter()
+        .map(|id| {
+            let (position, rotation) = frame.state.body_pose(*id).expect("own body");
+            (
+                *id,
+                BodyResult {
+                    position,
+                    rotation,
+                    velocity: frame.velocity[id],
+                    acceleration: frame.acceleration[id],
+                },
+            )
+        })
+        .collect();
+    Ok(ResultFrame {
+        time: frame.time,
+        bodies,
+        reactions: reactions.iter().map(ReactionResult::from).collect(),
+        measures: study
+            .measures
+            .iter()
+            .filter_map(|m| m.evaluate(sys, frame))
+            .collect(),
+        energy: energy(sys, &frame.state, &frame.velocity)?,
+        momentum: momentum(sys, &frame.state, &frame.velocity)?,
     })
 }
 
@@ -480,8 +478,18 @@ fn owner_label(owner: &EquationOwner) -> String {
     }
 }
 
-fn v3(v: DVec3) -> [f64; 3] {
-    [v.x, v.y, v.z]
+/// The columns of a frame and its rates: position, rotation, linear and
+/// angular velocity (bodies add their accelerations).
+const POSE_RATES: [&str; 13] = [
+    "x", "y", "z", "qx", "qy", "qz", "qw", "vx", "vy", "vz", "wx", "wy", "wz",
+];
+
+fn pose_rates(position: DVec3, rotation: DQuat, velocity: Twist) -> Vec<f64> {
+    let mut v = position.to_array().to_vec();
+    v.extend(rotation.to_array());
+    v.extend(velocity.linear.to_array());
+    v.extend(velocity.angular.to_array());
+    v
 }
 
 impl StudyResult {
@@ -494,117 +502,88 @@ impl StudyResult {
     /// round-trip decimal form.
     pub fn to_csv(&self) -> String {
         let mut header: Vec<String> = vec!["time".into()];
-        let mut rows: Vec<Vec<f64>> = Vec::with_capacity(self.frames.len());
+        let mut body = String::new();
         for (k, frame) in self.frames.iter().enumerate() {
             let mut row = vec![frame.time];
-            let mut push =
-                |label: String, values: &[f64], names: &[&str], header: &mut Vec<String>| {
-                    if k == 0 {
-                        header.extend(names.iter().map(|n| format!("{label}.{n}")));
-                    }
-                    row.extend_from_slice(values);
-                };
+            let mut push = |label: &str, values: &[f64], names: &[&str]| {
+                if k == 0 {
+                    header.extend(names.iter().map(|n| format!("{label}.{n}")));
+                }
+                row.extend_from_slice(values);
+            };
             for (id, b) in &frame.bodies {
-                let mut v = Vec::with_capacity(19);
-                v.extend(v3(b.position));
-                v.extend([b.rotation.x, b.rotation.y, b.rotation.z, b.rotation.w]);
-                v.extend(v3(b.velocity.linear));
-                v.extend(v3(b.velocity.angular));
-                v.extend(v3(b.acceleration.linear));
-                v.extend(v3(b.acceleration.angular));
-                push(
-                    format!("b{}", id.0),
-                    &v,
-                    &[
-                        "x", "y", "z", "qx", "qy", "qz", "qw", "vx", "vy", "vz", "wx", "wy", "wz",
-                        "ax", "ay", "az", "alx", "aly", "alz",
-                    ],
-                    &mut header,
-                );
+                let mut v = pose_rates(b.position, b.rotation, b.velocity);
+                v.extend(b.acceleration.linear.to_array());
+                v.extend(b.acceleration.angular.to_array());
+                let names: Vec<&str> = POSE_RATES
+                    .iter()
+                    .copied()
+                    .chain(["ax", "ay", "az", "alx", "aly", "alz"])
+                    .collect();
+                push(&format!("b{}", id.0), &v, &names);
             }
             for r in &frame.reactions {
-                let mut v: Vec<f64> = v3(r.force_on_i)
-                    .into_iter()
-                    .chain(v3(r.torque_on_i))
-                    .collect();
+                let mut v = [r.force_on_i.to_array(), r.torque_on_i.to_array()].concat();
                 let mut names = vec!["fx", "fy", "fz", "tx", "ty", "tz"];
                 if let Some(e) = r.effort {
                     v.push(e);
                     names.push("effort");
                 }
-                push(owner_label(&r.owner), &v, &names, &mut header);
+                push(&owner_label(&r.owner), &v, &names);
             }
             for m in &frame.measures {
-                let (name, v, names): (&str, Vec<f64>, Vec<&str>) = match m {
-                    MeasureValue::Point { name, motion } => (
+                match m {
+                    MeasureValue::Point { name, motion } => push(
                         name,
-                        [
-                            v3(motion.position),
-                            v3(motion.velocity),
-                            v3(motion.acceleration),
+                        &[
+                            motion.position.to_array(),
+                            motion.velocity.to_array(),
+                            motion.acceleration.to_array(),
                         ]
                         .concat(),
-                        vec!["x", "y", "z", "vx", "vy", "vz", "ax", "ay", "az"],
+                        &["x", "y", "z", "vx", "vy", "vz", "ax", "ay", "az"],
                     ),
-                    MeasureValue::Marker { name, motion } => {
-                        let q = motion.rotation;
-                        let mut v = v3(motion.position).to_vec();
-                        v.extend([q.x, q.y, q.z, q.w]);
-                        v.extend(v3(motion.velocity.linear));
-                        v.extend(v3(motion.velocity.angular));
-                        (
-                            name,
-                            v,
-                            vec![
-                                "x", "y", "z", "qx", "qy", "qz", "qw", "vx", "vy", "vz", "wx",
-                                "wy", "wz",
-                            ],
-                        )
-                    }
-                    MeasureValue::Relative { name, motion } => (
+                    MeasureValue::Marker { name, motion } => push(
                         name,
-                        [
-                            v3(motion.displacement),
-                            v3(motion.velocity),
-                            v3(motion.acceleration),
-                            v3(motion.angular_velocity),
+                        &pose_rates(motion.position, motion.rotation, motion.velocity),
+                        &POSE_RATES,
+                    ),
+                    MeasureValue::Relative { name, motion } => push(
+                        name,
+                        &[
+                            motion.displacement.to_array(),
+                            motion.velocity.to_array(),
+                            motion.acceleration.to_array(),
+                            motion.angular_velocity.to_array(),
                         ]
                         .concat(),
-                        vec![
-                            "dx", "dy", "dz", "vx", "vy", "vz", "ax", "ay", "az", "wx", "wy", "wz",
-                        ],
+                        &["dx", "dy", "dz", "vx", "vy", "vz", "ax", "ay", "az", "wx", "wy", "wz"],
                     ),
-                    MeasureValue::JointCoordinate { name, motion } => (
+                    MeasureValue::JointCoordinate { name, motion } => push(
                         name,
-                        vec![motion.value, motion.velocity, motion.acceleration],
-                        vec!["q", "qd", "qdd"],
+                        &[motion.value, motion.velocity, motion.acceleration],
+                        &["q", "qd", "qdd"],
                     ),
-                };
-                push(name.to_string(), &v, &names, &mut header);
+                }
             }
-            let e = frame.energy;
-            let p = frame.momentum;
+            let (e, p) = (frame.energy, frame.momentum);
             push(
-                "energy".into(),
+                "energy",
                 &[e.kinetic, e.gravity, e.elastic],
                 &["kinetic", "gravity", "elastic"],
-                &mut header,
             );
             push(
-                "momentum".into(),
-                &[v3(p.linear), v3(p.angular)].concat(),
+                "momentum",
+                &[p.linear.to_array(), p.angular.to_array()].concat(),
                 &["px", "py", "pz", "hx", "hy", "hz"],
-                &mut header,
             );
-            rows.push(row);
+            let cells: Vec<String> = row.iter().map(|v| format!("{v}")).collect();
+            body.push_str(&cells.join(","));
+            body.push('\n');
         }
         let mut out = header.join(",");
         out.push('\n');
-        for row in rows {
-            let cells: Vec<String> = row.iter().map(|v| format!("{v}")).collect();
-            out.push_str(&cells.join(","));
-            out.push('\n');
-        }
+        out.push_str(&body);
         out
     }
 }

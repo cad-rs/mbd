@@ -1,13 +1,12 @@
 //! Joints (kinematic constraints between two markers) and their constraint
-//! equations. The joint vocabulary mirrors the assembly domain's `PairType`.
-//! Drivers live in [`crate::driver`] (re-exported here for the M0 paths).
+//! equations: the lower pairs every CAD mate set maps onto, plus the joint
+//! primitives. Drivers live in [`crate::driver`].
 
 use serde::{Deserialize, Serialize};
 
 use crate::body::MarkerId;
+use crate::driver::DriverSlot;
 use crate::jet::{FrameJet, Jet};
-
-pub use crate::driver::{Driver, DriverProfile, DriverSample, DriverSlot};
 
 /// Stable joint identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]

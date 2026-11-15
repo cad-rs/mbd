@@ -30,7 +30,7 @@ fn export(dir: &Path) -> Result<(), String> {
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     let mut list = String::new();
     for case in cases::all() {
-        let xml = rcad_mbd::write_mjcf(&case.system, &rcad_mbd::MjcfOptions::default())
+        let xml = rcad_mbd::write_mjcf(&case.system)
             .map_err(|e| format!("{}: {e}", case.name))?;
         let path = dir.join(format!("{}.xml", case.name));
         std::fs::write(&path, xml).map_err(|e| e.to_string())?;

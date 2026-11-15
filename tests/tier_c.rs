@@ -24,7 +24,7 @@ fn load(name: &str) -> Option<Reference> {
 #[test]
 fn tier_c_cases_export() {
     for case in cases::all() {
-        let xml = write_mjcf(&case.system, &MjcfOptions::default())
+        let xml = write_mjcf(&case.system)
             .unwrap_or_else(|e| panic!("{}: {e}", case.name));
         assert!(
             xml.contains("<mujoco") && xml.contains("</mujoco>"),
@@ -102,7 +102,7 @@ fn mjcf_refuses_what_it_cannot_express() {
         },
     });
     assert_eq!(
-        write_mjcf(&driven, &MjcfOptions::default())
+        write_mjcf(&driven)
             .unwrap_err()
             .code,
         codes::MJCF_UNSUPPORTED
@@ -117,7 +117,7 @@ fn mjcf_refuses_what_it_cannot_express() {
         })
         .unwrap();
     assert_eq!(
-        write_mjcf(&loaded, &MjcfOptions::default())
+        write_mjcf(&loaded)
             .unwrap_err()
             .code,
         codes::MJCF_UNSUPPORTED

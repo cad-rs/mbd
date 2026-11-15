@@ -1,31 +1,27 @@
-//! `rcad-mbd`: the multibody-dynamics backend (route card: `ROADMAP.md`).
+//! `rcad-mbd`: a standalone, kernel-neutral multibody-dynamics library.
 //!
-//! A standalone library in the `rcad-gcs` mould: pure math and data, no OCCT,
-//! no B-rep. Mass properties arrive as numbers (any mass-property tool's output,
-//! converted to SI by the caller); the crate consumes rigid bodies, markers,
-//! joints, drivers and force elements and — from M1 on — produces state
-//! trajectories and joint reactions.
+//! Rigid bodies (mass properties as numbers, SI), markers, joints, drivers
+//! and force elements in ([`System`]); kinematic sweeps, forward dynamics,
+//! static equilibrium, joint reactions and energy / momentum audits out.
+//! Pure math and data — no B-rep, no CAD-kernel dependency: any kernel or
+//! application writes its own adapter (`docs/INTEGRATING.md`).
 //!
-//! Architecture decisions (fixed, see the roadmap §3):
+//! Entry points: [`run_study`] (an analysis described as a [`Study`], one
+//! [`StudyResult`]); underneath, [`kinematic_sweep`], [`simulate`],
+//! [`static_equilibrium`], [`forward_dynamics`], [`reactions`]. Exports for
+//! cross-checks: [`write_asmt`] (OndselSolver), [`write_mjcf`] (MuJoCo).
+//!
+//! How it models (roadmap §3):
 //! - **Maximal coordinates**: every body carries 6 DOF; joints are constraint
-//!   equations (Lagrange multipliers from M2). Closed loops cost nothing.
+//!   equations with Lagrange multipliers (the joint reactions). Closed loops
+//!   cost nothing; redundant equations are detected and reported.
+//! - **Velocities in the world frame**: per free body, the linear velocity of
+//!   the body-frame origin and the angular velocity ([`Twist`]).
+//! - **Index-3 HHT-α** time integration with error control.
 //! - **SI units** inside the crate: kg, m, s, rad, N. Callers convert.
 //! - **Deterministic**: tables are `BTreeMap`s keyed by stable ids, so
-//!   equation numbering and serialized bytes are reproducible.
+//!   equation numbering, trajectories and serialized bytes are reproducible.
 //! - **Failures are data**: [`MbdError`] `{code, detail, hint}`.
-//!
-//! - **Velocities in the world frame**: per free body, the linear velocity of
-//!   the body-frame origin and the angular velocity, both inertial
-//!   ([`Twist`]).
-//!
-//! Milestones: M0 data model + golden (done); M1 kinematic three levels
-//! (position via `rcad-gcs`, velocity/acceleration linear solves against
-//! the analytic Jacobian, redundancy diagnosis, time sweep; done); M2 forward
-//! dynamics (equations of motion, dynamic IC, static equilibrium), index-3
-//! HHT-α integration with error control, joint reactions (done); M3 force library
-//! (function forces, follower loads, joint springs, bushings; done);
-//! M4 kernel-neutral integration surface (each consumer — any CAD kernel —
-//! writes its own adapter). Nothing here pre-seeds M5 (contact/friction).
 
 pub mod asmt;
 pub mod body;
@@ -67,7 +63,7 @@ pub use kinematics::{
 };
 pub use measure::{JointMotion, MarkerMotion, PointMotion, RelativeMotion};
 pub use merge::{merge_fixed_groups, MergedSystem, Placement};
-pub use mjcf::{write_mjcf, MjcfOptions};
+pub use mjcf::write_mjcf;
 pub use reaction::{reactions, Reaction};
 pub use study::{
     run_study, Analysis, BodyResult, Integrator, MeasureRequest, MeasureValue, ReactionResult, ResultFrame, Study,

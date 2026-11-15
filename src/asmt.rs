@@ -26,11 +26,10 @@
 //! motion reaction series OndselSolver writes then carry the gravity load —
 //! the Tier B reference for reaction recovery). No force elements.
 
-use std::fmt::Write as _;
 
 use glam::{DMat3, DQuat, DVec3};
 
-use crate::body::Body;
+use crate::body::{Body, BodyId, MarkerId};
 use crate::driver::{DriverProfile, DriverSlot};
 use crate::error::{codes, MbdError};
 use crate::joint::JointKind;
@@ -47,8 +46,8 @@ pub struct AsmtSimulation {
 
 const ASSEMBLY: &str = "Assembly";
 
-fn part_name(body: &Body) -> String {
-    format!("b{}", body.id.0)
+fn part_name(body: BodyId) -> String {
+    format!("b{}", body.0)
 }
 
 /// Export `sys` as `.asmt` text.
@@ -110,15 +109,8 @@ pub fn write_asmt(sys: &System, sim: &AsmtSimulation) -> Result<String, MbdError
 
     line(w, 1, "RefPoints");
     for body in sys.bodies.values().filter(|b| b.grounded) {
-        ref_point(
-            w,
-            2,
-            &[(
-                format!("ground{}", body.id.0),
-                body.translation,
-                body.rotation,
-            )],
-        );
+        let name = format!("ground{}", body.id.0);
+        ref_point(w, 2, &name, body.translation, body.rotation);
     }
     line(w, 1, "RefCurves");
     line(w, 1, "RefSurfaces");
@@ -127,40 +119,22 @@ pub fn write_asmt(sys: &System, sim: &AsmtSimulation) -> Result<String, MbdError
     for body in sys.bodies.values() {
         line(w, 2, "Part");
         line(w, 3, "Name");
-        line(w, 4, &part_name(body));
+        line(w, 4, &part_name(body.id));
         frame(w, 3, body.translation, body.rotation);
         rates(w, 3);
         line(w, 3, "FeatureOrder");
         mass_marker(w, 3, body)?;
         line(w, 3, "RefPoints");
         if body.grounded {
-            ref_point(
-                w,
-                4,
-                &[("FixingMarker".into(), DVec3::ZERO, DQuat::IDENTITY)],
-            );
+            ref_point(w, 4, "FixingMarker", DVec3::ZERO, DQuat::IDENTITY);
         }
         for marker in sys.markers.values().filter(|m| m.body == body.id) {
-            ref_point(
-                w,
-                4,
-                &[(
-                    format!("m{}", marker.id.0),
-                    marker.translation,
-                    marker.rotation,
-                )],
-            );
+            let name = format!("m{}", marker.id.0);
+            ref_point(w, 4, &name, marker.translation, marker.rotation);
             for &index in &aliased {
                 if sys.joints[&sys.drivers[index].joint].marker1 == marker.id {
-                    ref_point(
-                        w,
-                        4,
-                        &[(
-                            alias_name(marker.id, index),
-                            marker.translation,
-                            marker.rotation,
-                        )],
-                    );
+                    let alias = alias_name(marker.id, index);
+                    ref_point(w, 4, &alias, marker.translation, marker.rotation);
                 }
             }
         }
@@ -177,7 +151,7 @@ pub fn write_asmt(sys: &System, sim: &AsmtSimulation) -> Result<String, MbdError
             w,
             &format!("grounded{}", body.id.0),
             &format!("/{ASSEMBLY}/ground{}", body.id.0),
-            &format!("/{ASSEMBLY}/{}/FixingMarker", part_name(body)),
+            &format!("/{ASSEMBLY}/{}/FixingMarker", part_name(body.id)),
         );
     }
     for joint in sys.joints.values().filter(|j| !j.suppressed) {
@@ -275,22 +249,21 @@ fn joint_keyword(kind: JointKind) -> &'static str {
     }
 }
 
-fn marker_path(sys: &System, marker: crate::body::MarkerId) -> String {
-    let body = &sys.bodies[&sys.markers[&marker].body];
-    format!("/{ASSEMBLY}/{}/m{}", part_name(body), marker.0)
+/// The path of a marker-like name on the part carrying `marker`.
+fn path_on_part(sys: &System, marker: MarkerId, name: &str) -> String {
+    format!("/{ASSEMBLY}/{}/{name}", part_name(sys.markers[&marker].body))
 }
 
-fn alias_name(marker: crate::body::MarkerId, driver: usize) -> String {
+fn marker_path(sys: &System, marker: MarkerId) -> String {
+    path_on_part(sys, marker, &format!("m{}", marker.0))
+}
+
+fn alias_name(marker: MarkerId, driver: usize) -> String {
     format!("m{}d{driver}", marker.0)
 }
 
-fn alias_path(sys: &System, marker: crate::body::MarkerId, driver: usize) -> String {
-    let body = &sys.bodies[&sys.markers[&marker].body];
-    format!(
-        "/{ASSEMBLY}/{}/{}",
-        part_name(body),
-        alias_name(marker, driver)
-    )
+fn alias_path(sys: &System, marker: MarkerId, driver: usize) -> String {
+    path_on_part(sys, marker, &alias_name(marker, driver))
 }
 
 /// The driver profile as an OndselSolver `time` expression.
@@ -359,17 +332,15 @@ fn item_ij(w: &mut String, name: &str, marker_i: &str, marker_j: &str) {
     line(w, 5, marker_j);
 }
 
-/// A reference point at the container origin carrying `markers`.
-fn ref_point(w: &mut String, level: usize, markers: &[(String, DVec3, DQuat)]) {
+/// A reference point at the container origin carrying one marker.
+fn ref_point(w: &mut String, level: usize, name: &str, t: DVec3, r: DQuat) {
     line(w, level, "RefPoint");
     frame(w, level + 1, DVec3::ZERO, DQuat::IDENTITY);
     line(w, level + 1, "Markers");
-    for (name, t, r) in markers {
-        line(w, level + 2, "Marker");
-        line(w, level + 3, "Name");
-        line(w, level + 4, name);
-        frame(w, level + 3, *t, *r);
-    }
+    line(w, level + 2, "Marker");
+    line(w, level + 3, "Name");
+    line(w, level + 4, name);
+    frame(w, level + 3, t, r);
 }
 
 fn frame(w: &mut String, level: usize, t: DVec3, r: DQuat) {
@@ -410,7 +381,8 @@ fn number(v: f64) -> String {
 fn vector(v: DVec3) -> String {
     let mut s = String::new();
     for c in [v.x, v.y, v.z] {
-        let _ = write!(s, "{}\t", number(c));
+        s.push_str(&number(c));
+        s.push('\t');
     }
     s
 }

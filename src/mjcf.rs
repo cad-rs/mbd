@@ -18,7 +18,8 @@
 //!   `JointSpringDamper` (zero preload) on a tree joint as the MuJoCo
 //!   joint's `stiffness` / `damping` / `springref`;
 //! - no drivers, couplers or other force elements. Contacts are disabled
-//!   and the energy computation enabled.
+//!   and the energy computation enabled; RK4 at a 0.1 ms step (the Tier C
+//!   references are pinned to it).
 //!
 //! Bodies are named `b{id}`, so a MuJoCo `xpos` / `xquat` per body maps back
 //! to this crate's body poses.
@@ -36,23 +37,9 @@ use crate::joint::{Joint, JointId, JointKind};
 use crate::kinematics::{position_ic, KinematicState};
 use crate::system::System;
 
-/// Export settings.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct MjcfOptions {
-    /// MuJoCo's fixed time step (s).
-    pub timestep: f64,
-    /// MuJoCo integrator name (`"RK4"`, `"implicit"`, `"Euler"`).
-    pub integrator: &'static str,
-}
-
-impl Default for MjcfOptions {
-    fn default() -> Self {
-        Self {
-            timestep: 1e-4,
-            integrator: "RK4",
-        }
-    }
-}
+/// MuJoCo's fixed step and integrator.
+const TIMESTEP: f64 = 1e-4;
+const INTEGRATOR: &str = "RK4";
 
 fn unsupported(detail: impl Into<String>) -> MbdError {
     MbdError::new(
@@ -72,17 +59,25 @@ fn q(r: DQuat) -> String {
     format!("{} {} {} {}", r.w, r.x, r.y, r.z)
 }
 
-/// The tree: per free body, the joint reaching it from its parent (or
-/// none: a free-floating body), the parent body (`None` = world).
+/// The tree: per free body, its parent body (`None` = world) and the joint
+/// reaching it (`None`: a free-floating body); the children per parent; the
+/// loop-closing joints.
 struct Tree {
     parent: BTreeMap<BodyId, (Option<BodyId>, Option<JointId>)>,
+    children: BTreeMap<Option<BodyId>, Vec<BodyId>>,
     loops: Vec<JointId>,
+}
+
+impl Tree {
+    fn children_of(&self, parent: Option<BodyId>) -> Vec<BodyId> {
+        self.children.get(&parent).cloned().unwrap_or_default()
+    }
 }
 
 fn build_tree(sys: &System) -> Result<Tree, MbdError> {
     let body_of = |m| sys.markers[&m].body;
     let grounded = |b: BodyId| sys.bodies[&b].grounded;
-    let mut parent: BTreeMap<BodyId, (Option<BodyId>, Option<JointId>)> = BTreeMap::new();
+    let mut parent = BTreeMap::new();
     let mut reached: BTreeSet<BodyId> = sys
         .bodies
         .values()
@@ -91,7 +86,8 @@ fn build_tree(sys: &System) -> Result<Tree, MbdError> {
         .collect();
     let mut used: BTreeSet<JointId> = BTreeSet::new();
     let active: Vec<&Joint> = sys.joints.values().filter(|j| !j.suppressed).collect();
-    // Breadth-first from the ground, joints in id order (deterministic).
+    // Repeated sweeps over the joints in id order until nothing new is
+    // reached (deterministic).
     loop {
         let mut grew = false;
         for j in &active {
@@ -104,6 +100,19 @@ fn build_tree(sys: &System) -> Result<Tree, MbdError> {
                 (false, true) => (b, a),
                 _ => continue,
             };
+            if !matches!(
+                j.kind,
+                JointKind::Revolute
+                    | JointKind::Prismatic
+                    | JointKind::Cylindrical
+                    | JointKind::Spherical
+                    | JointKind::Fixed
+            ) {
+                return Err(unsupported(format!(
+                    "tree joint {} is {:?}, which has no MJCF joint type here",
+                    j.id.0, j.kind
+                )));
+            }
             used.insert(j.id);
             reached.insert(to);
             parent.insert(to, ((!grounded(from)).then_some(from), Some(j.id)));
@@ -141,11 +150,134 @@ fn build_tree(sys: &System) -> Result<Tree, MbdError> {
             )));
         }
     }
-    Ok(Tree { parent, loops })
+    let mut children: BTreeMap<Option<BodyId>, Vec<BodyId>> = BTreeMap::new();
+    for (child, (p, _)) in &parent {
+        children.entry(*p).or_default().push(*child);
+    }
+    Ok(Tree {
+        parent,
+        children,
+        loops,
+    })
+}
+
+/// The depth-first body writer.
+struct Emitter<'a> {
+    sys: &'a System,
+    tree: &'a Tree,
+    state: &'a KinematicState,
+    /// Tendon sites per body (body-frame positions).
+    sites: &'a BTreeMap<BodyId, Vec<(String, DVec3)>>,
+    /// Joint springs by tree joint: stiffness, damping, reference.
+    joint_spring: &'a BTreeMap<(JointId, DriverSlot), (f64, f64, f64)>,
+    out: String,
+    /// Initial `qvel`, in MuJoCo's dof order.
+    qvel: Vec<f64>,
+}
+
+impl Emitter<'_> {
+    fn body(&mut self, body: BodyId, depth: usize) {
+        let indent = "  ".repeat(depth + 2);
+        let b: &Body = &self.sys.bodies[&body];
+        let (t, r) = self.state.body_pose(body).expect("own body");
+        let (parent, joint) = self.tree.parent[&body];
+        let (pt, pr) = match parent {
+            Some(p) => self.state.body_pose(p).expect("own body"),
+            None => (DVec3::ZERO, DQuat::IDENTITY),
+        };
+        let _ = writeln!(
+            self.out,
+            "{indent}<body name=\"b{}\" pos=\"{}\" quat=\"{}\">",
+            body.0,
+            v(pr.inverse() * (t - pt)),
+            q(pr.inverse() * r)
+        );
+        let i: DMat3 = b.inertia_com;
+        let _ = writeln!(
+            self.out,
+            "{indent}  <inertial pos=\"{}\" mass=\"{}\" fullinertia=\"{} {} {} {} {} {}\"/>",
+            v(b.com),
+            b.mass_kg,
+            i.x_axis.x,
+            i.y_axis.y,
+            i.z_axis.z,
+            i.y_axis.x,
+            i.z_axis.x,
+            i.z_axis.y
+        );
+        match joint {
+            None => {
+                let _ = writeln!(self.out, "{indent}  <freejoint name=\"free{}\"/>", body.0);
+                // MuJoCo free-joint velocity: world linear velocity of the
+                // body origin, angular velocity in the body frame.
+                let wl = r.inverse() * b.angular_velocity;
+                self.qvel
+                    .extend([b.velocity.x, b.velocity.y, b.velocity.z, wl.x, wl.y, wl.z]);
+            }
+            Some(jid) => self.joint(&indent, body, jid),
+        }
+        if let Some(list) = self.sites.get(&body) {
+            for (name, local) in list {
+                let _ = writeln!(
+                    self.out,
+                    "{indent}  <site name=\"{name}\" pos=\"{}\"/>",
+                    v(*local)
+                );
+            }
+        }
+        for child in self.tree.children_of(Some(body)) {
+            self.body(child, depth + 1);
+        }
+        let _ = writeln!(self.out, "{indent}</body>");
+    }
+
+    /// The MuJoCo joint(s) of tree joint `jid` reaching `body`.
+    fn joint(&mut self, indent: &str, body: BodyId, jid: JointId) {
+        let j = &self.sys.joints[&jid];
+        // The marker on this (child) body defines the joint frame.
+        let m = if self.sys.markers[&j.marker2].body == body {
+            &self.sys.markers[&j.marker2]
+        } else {
+            &self.sys.markers[&j.marker1]
+        };
+        let pos = v(m.translation);
+        let axis = v(m.rotation * DVec3::Z);
+        let mut line = |kind: &str, slot: DriverSlot, suffix: &str| {
+            let spring = self
+                .joint_spring
+                .get(&(jid, slot))
+                .map(|(k, c, r0)| format!(" stiffness=\"{k}\" damping=\"{c}\" springref=\"{r0}\""))
+                .unwrap_or_default();
+            let _ = writeln!(
+                self.out,
+                "{indent}  <joint name=\"j{}{suffix}\" type=\"{kind}\" pos=\"{pos}\" axis=\"{axis}\"{spring}/>",
+                jid.0
+            );
+            self.qvel.push(0.0);
+        };
+        match j.kind {
+            JointKind::Revolute => line("hinge", DriverSlot::Rotation, ""),
+            JointKind::Prismatic => line("slide", DriverSlot::Translation, ""),
+            JointKind::Cylindrical => {
+                line("hinge", DriverSlot::Rotation, "r");
+                line("slide", DriverSlot::Translation, "t");
+            }
+            JointKind::Spherical => {
+                let _ = writeln!(
+                    self.out,
+                    "{indent}  <joint name=\"j{}\" type=\"ball\" pos=\"{pos}\"/>",
+                    jid.0
+                );
+                self.qvel.extend([0.0; 3]);
+            }
+            JointKind::Fixed => {}
+            _ => unreachable!("build_tree admits only exportable tree joints"),
+        }
+    }
 }
 
 /// Export `sys` as MJCF text.
-pub fn write_mjcf(sys: &System, options: &MjcfOptions) -> Result<String, MbdError> {
+pub fn write_mjcf(sys: &System) -> Result<String, MbdError> {
     sys.validate()?;
     if !sys.drivers.is_empty() {
         return Err(unsupported(
@@ -158,8 +290,7 @@ pub fn write_mjcf(sys: &System, options: &MjcfOptions) -> Result<String, MbdErro
     let tree = build_tree(sys)?;
     let state = position_ic(sys, 0.0)?;
     let pose = |b: BodyId| state.body_pose(b).expect("own body");
-    // Joint springs by tree joint.
-    let mut joint_spring: BTreeMap<(JointId, DriverSlot), (f64, f64, f64)> = BTreeMap::new();
+    let mut joint_spring = BTreeMap::new();
     let mut tendons = Vec::new();
     for f in sys.forces.values() {
         match f {
@@ -195,14 +326,12 @@ pub fn write_mjcf(sys: &System, options: &MjcfOptions) -> Result<String, MbdErro
             }
         }
     }
-    for b in sys.bodies.values() {
-        if !b.grounded
-            && tree.parent.get(&b.id).is_some_and(|p| p.1.is_some())
-            && (b.velocity != DVec3::ZERO || b.angular_velocity != DVec3::ZERO)
-        {
+    for (id, (_, joint)) in &tree.parent {
+        let b = &sys.bodies[id];
+        if joint.is_some() && (b.velocity != DVec3::ZERO || b.angular_velocity != DVec3::ZERO) {
             return Err(unsupported(format!(
                 "body {} has an initial velocity but is jointed; only free bodies carry initial velocities in the export",
-                b.id.0
+                id.0
             )));
         }
     }
@@ -221,9 +350,7 @@ pub fn write_mjcf(sys: &System, options: &MjcfOptions) -> Result<String, MbdErro
     let g = sys.gravity.unwrap_or(DVec3::ZERO);
     let _ = writeln!(
         w,
-        "  <option timestep=\"{}\" integrator=\"{}\" gravity=\"{}\">",
-        options.timestep,
-        options.integrator,
+        "  <option timestep=\"{TIMESTEP}\" integrator=\"{INTEGRATOR}\" gravity=\"{}\">",
         v(g)
     );
     let _ = writeln!(w, "    <flag contact=\"disable\" energy=\"enable\"/>");
@@ -253,173 +380,20 @@ pub fn write_mjcf(sys: &System, options: &MjcfOptions) -> Result<String, MbdErro
             }
         }
     }
-    let children = |p: Option<BodyId>| -> Vec<BodyId> {
-        tree.parent
-            .iter()
-            .filter(|(_, (par, _))| *par == p)
-            .map(|(c, _)| *c)
-            .collect()
-    };
-    let mut qvel: Vec<f64> = Vec::new();
-    let mut has_free = false;
-    // Depth-first emission.
-    #[derive(Clone, Copy)]
-    struct Ctx<'c> {
-        sys: &'c System,
-        tree: &'c Tree,
-        state: &'c KinematicState,
-        sites: &'c BTreeMap<BodyId, Vec<(String, DVec3)>>,
-        joint_spring: &'c BTreeMap<(JointId, DriverSlot), (f64, f64, f64)>,
-        children: &'c dyn Fn(Option<BodyId>) -> Vec<BodyId>,
-    }
-    fn emit(
-        ctx: Ctx,
-        w: &mut String,
-        body: BodyId,
-        depth: usize,
-        qvel: &mut Vec<f64>,
-        has_free: &mut bool,
-    ) {
-        let Ctx {
-            sys,
-            tree,
-            state,
-            sites,
-            joint_spring,
-            children,
-        } = ctx;
-        let indent = "  ".repeat(depth + 2);
-        let b: &Body = &sys.bodies[&body];
-        let (t, r) = state.body_pose(body).expect("own body");
-        let (parent, joint) = tree.parent[&body];
-        let (pt, pr) = match parent {
-            Some(p) => state.body_pose(p).expect("own body"),
-            None => (DVec3::ZERO, DQuat::IDENTITY),
-        };
-        let rel_t = pr.inverse() * (t - pt);
-        let rel_r = pr.inverse() * r;
-        let _ = writeln!(
-            w,
-            "{indent}<body name=\"b{}\" pos=\"{}\" quat=\"{}\">",
-            body.0,
-            v(rel_t),
-            q(rel_r)
-        );
-        let i: DMat3 = b.inertia_com;
-        let _ = writeln!(
-            w,
-            "{indent}  <inertial pos=\"{}\" mass=\"{}\" fullinertia=\"{} {} {} {} {} {}\"/>",
-            v(b.com),
-            b.mass_kg,
-            i.x_axis.x,
-            i.y_axis.y,
-            i.z_axis.z,
-            i.y_axis.x,
-            i.z_axis.x,
-            i.z_axis.y
-        );
-        match joint {
-            None => {
-                *has_free = true;
-                let _ = writeln!(w, "{indent}  <freejoint name=\"free{}\"/>", body.0);
-                // MuJoCo free-joint velocity: world linear velocity of the
-                // body origin, angular velocity in the body frame.
-                let wl = r.inverse() * b.angular_velocity;
-                qvel.extend([b.velocity.x, b.velocity.y, b.velocity.z, wl.x, wl.y, wl.z]);
-            }
-            Some(jid) => {
-                let j = &sys.joints[&jid];
-                // The marker on this (child) body defines the joint frame.
-                let m = if sys.markers[&j.marker2].body == body {
-                    &sys.markers[&j.marker2]
-                } else {
-                    &sys.markers[&j.marker1]
-                };
-                let axis = m.rotation * DVec3::Z;
-                let spring = |slot| {
-                    joint_spring
-                        .get(&(jid, slot))
-                        .map(|(k, c, r0)| {
-                            format!(" stiffness=\"{k}\" damping=\"{c}\" springref=\"{r0}\"")
-                        })
-                        .unwrap_or_default()
-                };
-                let pos = v(m.translation);
-                let ax = v(axis);
-                let joint_line = |w: &mut String,
-                                  qvel: &mut Vec<f64>,
-                                  kind: &str,
-                                  slot: DriverSlot,
-                                  suffix: &str| {
-                    let extra = spring(slot);
-                    let _ = writeln!(
-                        w,
-                        "{indent}  <joint name=\"j{}{suffix}\" type=\"{kind}\" pos=\"{pos}\" axis=\"{ax}\"{extra}/>",
-                        jid.0
-                    );
-                    qvel.push(0.0);
-                };
-                match j.kind {
-                    JointKind::Revolute => joint_line(w, qvel, "hinge", DriverSlot::Rotation, ""),
-                    JointKind::Prismatic => {
-                        joint_line(w, qvel, "slide", DriverSlot::Translation, "")
-                    }
-                    JointKind::Cylindrical => {
-                        joint_line(w, qvel, "hinge", DriverSlot::Rotation, "r");
-                        joint_line(w, qvel, "slide", DriverSlot::Translation, "t");
-                    }
-                    JointKind::Spherical => {
-                        let _ = writeln!(
-                            w,
-                            "{indent}  <joint name=\"j{}\" type=\"ball\" pos=\"{pos}\"/>",
-                            jid.0
-                        );
-                        qvel.extend([0.0; 3]);
-                    }
-                    JointKind::Fixed => {}
-                    _ => unreachable!("checked before emission"),
-                }
-            }
-        }
-        if let Some(list) = sites.get(&body) {
-            for (name, local) in list {
-                let _ = writeln!(w, "{indent}  <site name=\"{name}\" pos=\"{}\"/>", v(*local));
-            }
-        }
-        for c in children(Some(body)) {
-            emit(ctx, w, c, depth + 1, qvel, has_free);
-        }
-        let _ = writeln!(w, "{indent}</body>");
-    }
-    for (_, joint) in tree.parent.values() {
-        if let Some(j) = joint {
-            let kind = sys.joints[j].kind;
-            if !matches!(
-                kind,
-                JointKind::Revolute
-                    | JointKind::Prismatic
-                    | JointKind::Cylindrical
-                    | JointKind::Spherical
-                    | JointKind::Fixed
-            ) {
-                return Err(unsupported(format!(
-                    "tree joint {} is {kind:?}, which has no MJCF joint type here",
-                    j.0
-                )));
-            }
-        }
-    }
-    let ctx = Ctx {
+    let mut emitter = Emitter {
         sys,
         tree: &tree,
         state: &state,
         sites: &sites,
         joint_spring: &joint_spring,
-        children: &children,
+        out,
+        qvel: Vec::new(),
     };
-    for root in children(None) {
-        emit(ctx, w, root, 0, &mut qvel, &mut has_free);
+    for root in tree.children_of(None) {
+        emitter.body(root, 0);
     }
+    let Emitter { mut out, qvel, .. } = emitter;
+    let w = &mut out;
     let _ = writeln!(w, "  </worldbody>");
     if !tree.loops.is_empty() {
         let _ = writeln!(w, "  <equality>");
@@ -466,7 +440,8 @@ pub fn write_mjcf(sys: &System, options: &MjcfOptions) -> Result<String, MbdErro
         }
         let _ = writeln!(w, "  </tendon>");
     }
-    if has_free && qvel.iter().any(|x| *x != 0.0) {
+    // Only free bodies contribute non-zero velocities.
+    if qvel.iter().any(|x| *x != 0.0) {
         let qv: Vec<String> = qvel.iter().map(|x| x.to_string()).collect();
         let _ = writeln!(w, "  <keyframe>");
         let _ = writeln!(w, "    <key name=\"initial\" qvel=\"{}\"/>", qv.join(" "));
